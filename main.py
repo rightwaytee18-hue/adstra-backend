@@ -1,5 +1,6 @@
 import logging
 import os
+import threading
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Header, Depends
@@ -9,6 +10,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger(__name__)
 
 import scheduler as sched
 from db import get_db
@@ -54,9 +56,15 @@ def run_rules(project_id: str):
 
 @app.post("/competitor/{project_id}/scrape", dependencies=[Depends(verify_secret)])
 def scrape_competitors(project_id: str):
-    """Trigger competitor scrape for a project."""
-    result = scrape_for_project(project_id)
-    return result
+    """Kick off competitor scrape in a background thread and return immediately."""
+    def run():
+        try:
+            scrape_for_project(project_id)
+        except Exception as e:
+            logger.error(f"Background scrape error for {project_id}: {e}")
+
+    threading.Thread(target=run, daemon=True).start()
+    return {"started": True, "project_id": project_id}
 
 
 @app.get("/rules/{project_id}/log", dependencies=[Depends(verify_secret)])

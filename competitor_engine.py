@@ -113,6 +113,7 @@ def run_for_project(project_id: str) -> dict:
 
 
 def run_all_projects() -> dict:
+    import time
     db = get_db()
     resp = db.table('projects').select('id').execute()
     results = {}
@@ -121,4 +122,5 @@ def run_all_projects() -> dict:
             results[p['id']] = run_for_project(p['id'])
         except Exception as e:
             results[p['id']] = {'error': str(e)}
+        time.sleep(5)
     return results
