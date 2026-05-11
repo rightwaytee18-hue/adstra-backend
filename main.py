@@ -13,6 +13,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 import scheduler as sched
 from db import get_db
 from rules_engine import run_for_project
+from competitor_engine import run_for_project as scrape_for_project
 
 API_SECRET = os.environ.get("API_SECRET", "")
 
@@ -49,6 +50,13 @@ def run_rules(project_id: str):
     """Manually trigger rules for a project. Called from the frontend."""
     actions = run_for_project(project_id)
     return {"actions_taken": len(actions), "actions": actions}
+
+
+@app.post("/competitor/{project_id}/scrape", dependencies=[Depends(verify_secret)])
+def scrape_competitors(project_id: str):
+    """Trigger competitor scrape for a project."""
+    result = scrape_for_project(project_id)
+    return result
 
 
 @app.get("/rules/{project_id}/log", dependencies=[Depends(verify_secret)])
