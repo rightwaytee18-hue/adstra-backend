@@ -3,7 +3,7 @@ import os
 import threading
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, Header, Depends
+from fastapi import FastAPI, HTTPException, Header, Depends, Body
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 
@@ -16,6 +16,7 @@ import scheduler as sched
 from db import get_db
 from rules_engine import run_for_project
 from competitor_engine import run_for_project as scrape_for_project
+from creative_engine import generate_for_project
 
 API_SECRET = os.environ.get("API_SECRET", "")
 
@@ -65,6 +66,18 @@ def scrape_competitors(project_id: str):
 
     threading.Thread(target=run, daemon=True).start()
     return {"started": True, "project_id": project_id}
+
+
+@app.post("/creative/{project_id}/generate", dependencies=[Depends(verify_secret)])
+def generate_creative(project_id: str, body: dict = Body(...)):
+    """Generate an ad creative using Gemini. Modes: fresh | iterate | edit."""
+    mode = body.pop("mode", None)
+    if not mode:
+        raise HTTPException(status_code=400, detail="mode required")
+    result = generate_for_project(project_id, mode, body)
+    if result.get("error"):
+        raise HTTPException(status_code=500, detail=result["error"])
+    return result
 
 
 @app.get("/rules/{project_id}/log", dependencies=[Depends(verify_secret)])
