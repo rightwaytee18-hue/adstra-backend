@@ -17,6 +17,7 @@ from db import get_db
 from rules_engine import run_for_project
 from competitor_engine import run_for_project as scrape_for_project
 from creative_engine import generate_for_project
+from campaign_builder import preflight_for_project, publish_for_project
 
 API_SECRET = os.environ.get("API_SECRET", "")
 
@@ -77,6 +78,21 @@ def generate_creative(project_id: str, body: dict = Body(...)):
     result = generate_for_project(project_id, mode, body)
     if result.get("error"):
         raise HTTPException(status_code=500, detail=result["error"])
+    return result
+
+
+@app.post("/campaign/{project_id}/preflight", dependencies=[Depends(verify_secret)])
+def campaign_preflight(project_id: str, body: dict = Body(...)):
+    """Validate Meta credentials + account before publishing a campaign."""
+    return preflight_for_project(project_id, body)
+
+
+@app.post("/campaign/{project_id}/publish", dependencies=[Depends(verify_secret)])
+def campaign_publish(project_id: str, body: dict = Body(...)):
+    """Publish a campaign to Meta (always starts PAUSED)."""
+    result = publish_for_project(project_id, body)
+    if result.get("fatal"):
+        raise HTTPException(status_code=500, detail=result["fatal"])
     return result
 
 
