@@ -18,6 +18,11 @@ from rules_engine import run_for_project
 from competitor_engine import run_for_project as scrape_for_project
 from creative_engine import generate_for_project
 from campaign_builder import preflight_for_project, publish_for_project
+from autopilot_engine import (
+    run_for_project as autopilot_run,
+    briefing_for_project,
+    execute_approved_action,
+)
 
 API_SECRET = os.environ.get("API_SECRET", "")
 
@@ -44,10 +49,18 @@ def verify_secret(x_api_secret: str = Header(...)):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
 
+# ─────────────────────────────────────────────────────────────
+# Health
+# ─────────────────────────────────────────────────────────────
+
 @app.get("/health")
 def health():
     return {"status": "ok"}
 
+
+# ─────────────────────────────────────────────────────────────
+# Rules
+# ─────────────────────────────────────────────────────────────
 
 @app.post("/rules/{project_id}/run", dependencies=[Depends(verify_secret)])
 def run_rules(project_id: str):
@@ -55,6 +68,23 @@ def run_rules(project_id: str):
     actions = run_for_project(project_id)
     return {"actions_taken": len(actions), "actions": actions}
 
+
+@app.get("/rules/{project_id}/log", dependencies=[Depends(verify_secret)])
+def get_log(project_id: str, limit: int = 50):
+    """Fetch rule action log for a project."""
+    db = get_db()
+    resp = db.table("rule_action_log") \
+        .select("*") \
+        .eq("project_id", project_id) \
+        .order("triggered_at", desc=True) \
+        .limit(limit) \
+        .execute()
+    return {"log": resp.data or []}
+
+
+# ─────────────────────────────────────────────────────────────
+# Competitors
+# ─────────────────────────────────────────────────────────────
 
 @app.post("/competitor/{project_id}/scrape", dependencies=[Depends(verify_secret)])
 def scrape_competitors(project_id: str):
@@ -69,6 +99,10 @@ def scrape_competitors(project_id: str):
     return {"started": True, "project_id": project_id}
 
 
+# ─────────────────────────────────────────────────────────────
+# Creative Studio
+# ─────────────────────────────────────────────────────────────
+
 @app.post("/creative/{project_id}/generate", dependencies=[Depends(verify_secret)])
 def generate_creative(project_id: str, body: dict = Body(...)):
     """Generate an ad creative using Gemini. Modes: fresh | iterate | edit."""
@@ -80,6 +114,10 @@ def generate_creative(project_id: str, body: dict = Body(...)):
         raise HTTPException(status_code=500, detail=result["error"])
     return result
 
+
+# ─────────────────────────────────────────────────────────────
+# Campaign Builder
+# ─────────────────────────────────────────────────────────────
 
 @app.post("/campaign/{project_id}/preflight", dependencies=[Depends(verify_secret)])
 def campaign_preflight(project_id: str, body: dict = Body(...)):
@@ -96,14 +134,38 @@ def campaign_publish(project_id: str, body: dict = Body(...)):
     return result
 
 
-@app.get("/rules/{project_id}/log", dependencies=[Depends(verify_secret)])
-def get_log(project_id: str, limit: int = 50):
-    """Fetch rule action log for a project."""
+# ─────────────────────────────────────────────────────────────
+# Autopilot (Phase 8)
+# ─────────────────────────────────────────────────────────────
+
+@app.post("/autopilot/{project_id}/run", dependencies=[Depends(verify_secret)])
+def autopilot_run_endpoint(project_id: str):
+    """Manually trigger an autopilot analysis + action run for a project."""
+    result = autopilot_run(project_id)
+    return result
+
+
+@app.post("/autopilot/{project_id}/briefing", dependencies=[Depends(verify_secret)])
+def autopilot_briefing_endpoint(project_id: str):
+    """Generate (or re-generate) the weekly AI strategy briefing."""
+    result = briefing_for_project(project_id)
+    if not result.get("ok"):
+        raise HTTPException(status_code=500, detail=result.get("error", "Briefing failed"))
+    return result
+
+
+@app.post("/autopilot/{project_id}/actions/{action_id}/approve", dependencies=[Depends(verify_secret)])
+def approve_action(project_id: str, action_id: str):
+    """Execute a pending autopilot action that the user has approved."""
+    result = execute_approved_action(action_id, project_id)
+    if not result.get("ok"):
+        raise HTTPException(status_code=400, detail=result.get("error"))
+    return result
+
+
+@app.post("/autopilot/{project_id}/actions/{action_id}/reject", dependencies=[Depends(verify_secret)])
+def reject_action(project_id: str, action_id: str):
+    """Mark a pending autopilot action as rejected (no Meta call)."""
     db = get_db()
-    resp = db.table("rule_action_log") \
-        .select("*") \
-        .eq("project_id", project_id) \
-        .order("triggered_at", desc=True) \
-        .limit(limit) \
-        .execute()
-    return {"log": resp.data or []}
+    db.table("autopilot_actions").update({"status": "rejected"}).eq("id", action_id).eq("project_id", project_id).execute()
+    return {"ok": True}
