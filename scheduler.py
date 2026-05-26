@@ -26,14 +26,17 @@ def _run_competitor_job():
 
 
 def _run_autopilot_job():
-    """Daily autopilot run — scales winners, pauses losers (or queues for approval)."""
+    """Daily full autopilot — bootstrap new projects, optimize existing ones."""
     try:
-        from autopilot_engine import run_all_projects
-        results = run_all_projects()
-        taken = sum(r.get("actions_taken", 0) for r in results.values() if isinstance(r, dict))
-        queued = sum(r.get("actions_queued", 0) for r in results.values() if isinstance(r, dict))
+        from full_autopilot_engine import run_full_daily_all_projects
+        results = run_full_daily_all_projects()
+        paused = sum(r.get("ads_paused", 0) for r in results.values() if isinstance(r, dict))
+        created = sum(r.get("ads_created", 0) for r in results.values() if isinstance(r, dict))
+        taken = sum(r.get("budget_actions_taken", 0) for r in results.values() if isinstance(r, dict))
+        queued = sum(r.get("budget_actions_queued", 0) for r in results.values() if isinstance(r, dict))
         logger.info(
-            f"Scheduled autopilot run complete — {taken} actions taken, "
+            f"Scheduled full autopilot run complete — {paused} ads paused, "
+            f"{created} new ads created, {taken} budget actions taken, "
             f"{queued} queued for approval across {len(results)} projects"
         )
     except Exception as e:

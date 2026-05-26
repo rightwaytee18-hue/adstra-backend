@@ -19,9 +19,12 @@ from competitor_engine import run_for_project as scrape_for_project
 from creative_engine import generate_for_project
 from campaign_builder import preflight_for_project, publish_for_project
 from autopilot_engine import (
-    run_for_project as autopilot_run,
     briefing_for_project,
     execute_approved_action,
+)
+from full_autopilot_engine import (
+    run_full_daily as autopilot_run,
+    bootstrap_project,
 )
 
 API_SECRET = os.environ.get("API_SECRET", "")
@@ -138,9 +141,23 @@ def campaign_publish(project_id: str, body: dict = Body(...)):
 # Autopilot (Phase 8)
 # ─────────────────────────────────────────────────────────────
 
+@app.post("/autopilot/{project_id}/bootstrap", dependencies=[Depends(verify_secret)])
+def autopilot_bootstrap_endpoint(project_id: str):
+    """
+    Run the one-time bootstrap: generate creatives, create rules, publish first campaign.
+    Called when user enables autopilot for the first time.
+    """
+    result = bootstrap_project(project_id)
+    return result
+
+
 @app.post("/autopilot/{project_id}/run", dependencies=[Depends(verify_secret)])
 def autopilot_run_endpoint(project_id: str):
-    """Manually trigger an autopilot analysis + action run for a project."""
+    """
+    Run the full daily optimization loop on-demand.
+    Bootstraps first if not yet done, then: scan competitors, analyze ads,
+    pause losers, generate replacements, scale winners.
+    """
     result = autopilot_run(project_id)
     return result
 
