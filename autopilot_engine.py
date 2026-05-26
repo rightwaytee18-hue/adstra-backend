@@ -10,6 +10,7 @@ Two public entry points:
   briefing_for_project(project_id) — called weekly by scheduler
 """
 
+import json
 import logging
 import os
 from datetime import datetime, timezone, timedelta
@@ -24,6 +25,18 @@ logger = logging.getLogger(__name__)
 
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 MODEL = "claude-sonnet-4-6"
+
+# Module-level client — created once, reused across all calls
+_anthropic_client: Optional[anthropic.Anthropic] = None
+
+
+def _get_anthropic() -> anthropic.Anthropic:
+    global _anthropic_client
+    if _anthropic_client is None:
+        if not ANTHROPIC_API_KEY:
+            raise RuntimeError("ANTHROPIC_API_KEY not set")
+        _anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+    return _anthropic_client
 
 
 # ─────────────────────────────────────────────────────────────
@@ -84,7 +97,7 @@ def _create_notification(
     body: str,
     action_url: Optional[str] = None,
 ) -> None:
-    """Insert a notification row. Best-effort."""
+    """Insert a notification row. Best-effort — never raises."""
     try:
         db = get_db()
         db.table("notifications").insert({
@@ -101,9 +114,7 @@ def _create_notification(
 
 def _ask_claude(system: str, user_message: str) -> str:
     """Call Claude API and return the text response."""
-    if not ANTHROPIC_API_KEY:
-        raise RuntimeError("ANTHROPIC_API_KEY not set")
-    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+    client = _get_anthropic()
     msg = client.messages.create(
         model=MODEL,
         max_tokens=1500,
@@ -213,7 +224,6 @@ def run_for_project(project_id: str) -> dict:
         ],
     }
 
-    import json
     try:
         claude_response = _ask_claude(SYSTEM_PROMPT, json.dumps(snapshot, indent=2))
         # Strip markdown code fences if present
@@ -240,7 +250,9 @@ def run_for_project(project_id: str) -> dict:
         entity_id = rec.get("entity_id", "")
         entity_name = rec.get("entity_name", "")
         entity_level = rec.get("entity_level", "adset")
-        pct = float(rec.get("pct", 20))
+        # Use Claude's recommended pct, bounded by settings
+        rec_pct = float(rec.get("pct", scale_pct))
+        pct = min(rec_pct, 100.0)  # never more than 100%
         reasoning = rec.get("reasoning", "")
 
         if approval_mode == "auto":
@@ -248,7 +260,6 @@ def run_for_project(project_id: str) -> dict:
             value_before = None
             value_after = None
             exec_status = "executed"
-            error_detail = None
 
             try:
                 if action_type == "scale_budget":
@@ -270,16 +281,17 @@ def run_for_project(project_id: str) -> dict:
                 actions_taken += 1
             except (MetaAPIError, Exception) as e:
                 exec_status = "failed"
-                error_detail = str(e)
                 logger.error(f"[autopilot] Action {action_type} failed on {entity_id}: {e}")
 
             action_id = _save_action(
                 project_id, user_id, action_type, entity_id, entity_name,
                 entity_level, "roas", value_before, value_after, reasoning, exec_status,
             )
-            if exec_status == "executed" and action_type == "scale_budget":
+            if exec_status == "executed":
                 db = get_db()
-                db.table("autopilot_actions").update({"executed_at": datetime.now(timezone.utc).isoformat()}).eq("id", action_id).execute()
+                db.table("autopilot_actions").update(
+                    {"executed_at": datetime.now(timezone.utc).isoformat()}
+                ).eq("id", action_id).execute()
 
         else:
             # Queue for user approval
@@ -366,9 +378,9 @@ def briefing_for_project(project_id: str) -> dict:
 
     now = datetime.now(timezone.utc)
     week_ago = now - timedelta(days=7)
-    period_label = f"{week_ago.strftime('%b %-d')}–{now.strftime('%-d')}"
+    # %-d is Linux-only; use lstrip for cross-platform compatibility
+    period_label = f"{week_ago.strftime('%b')} {week_ago.day}–{now.day}"
 
-    import json
     snapshot = {
         "business_name": project.get("business_name", ""),
         "target_roas": project.get("target_roas"),
@@ -417,6 +429,7 @@ def execute_approved_action(action_id: str, project_id: str) -> dict:
     """
     Called when a user approves a pending autopilot action.
     Loads the action, executes it on Meta, updates status.
+    Uses the project's current autopilot settings for scale/reduce percentages.
     """
     db = get_db()
     resp = db.table("autopilot_actions").select("*").eq("id", action_id).eq("project_id", project_id).single().execute()
@@ -427,6 +440,12 @@ def execute_approved_action(action_id: str, project_id: str) -> dict:
         return {"ok": False, "error": f"Action status is '{action['status']}', not pending"}
 
     project = _load_project(project_id)
+    settings = _load_settings(project_id)
+
+    # Use settings-configured percentages so approval matches what was promised
+    scale_pct = float((settings or {}).get("scale_pct") or 20.0)
+    reduce_pct = 25.0  # reduce is always 25% (conservative)
+
     meta = MetaClient(project["meta_access_token"], project["ad_account_id"])
     action_type = action["action_type"]
     entity_id = action["entity_id"]
@@ -436,15 +455,15 @@ def execute_approved_action(action_id: str, project_id: str) -> dict:
 
     try:
         if action_type == "scale_budget":
-            old, new = meta.scale_budget(entity_id, 20)
+            old, new = meta.scale_budget(entity_id, scale_pct)
             value_before, value_after = old, new
         elif action_type == "reduce_budget":
-            old, new = meta.reduce_budget(entity_id, 25)
+            old, new = meta.reduce_budget(entity_id, reduce_pct)
             value_before, value_after = old, new
         elif action_type == "pause":
             meta.pause(entity_id)
         elif action_type == "alert":
-            pass
+            pass  # alerts are informational only
         else:
             return {"ok": False, "error": f"Unknown action type: {action_type}"}
 
@@ -455,7 +474,8 @@ def execute_approved_action(action_id: str, project_id: str) -> dict:
             "executed_at": datetime.now(timezone.utc).isoformat(),
         }).eq("id", action_id).execute()
 
-        return {"ok": True, "action_type": action_type, "entity_id": entity_id}
+        return {"ok": True, "action_type": action_type, "entity_id": entity_id,
+                "value_before": value_before, "value_after": value_after}
 
     except (MetaAPIError, Exception) as e:
         db.table("autopilot_actions").update({
@@ -466,13 +486,12 @@ def execute_approved_action(action_id: str, project_id: str) -> dict:
 
 
 # ─────────────────────────────────────────────────────────────
-# All-projects runner (for scheduler)
+# All-projects runners (for scheduler)
 # ─────────────────────────────────────────────────────────────
 
 def run_all_projects() -> dict[str, dict]:
     """Run autopilot for all projects where autopilot is enabled + Meta connected."""
     db = get_db()
-    # Join autopilot_settings where enabled=true
     resp = db.table("autopilot_settings").select("project_id").eq("enabled", True).execute()
     results = {}
     for row in (resp.data or []):
