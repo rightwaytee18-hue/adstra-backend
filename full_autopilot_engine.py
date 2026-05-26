@@ -30,6 +30,7 @@ Public API:
 import json
 import logging
 import os
+import random
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -202,6 +203,7 @@ def bootstrap_project(project_id: str) -> dict:
     """
     Run once when user first enables autopilot.
     Creates 3 creatives, 4 rules, and publishes the first campaign.
+    Idempotent: skips safely if already bootstrapped.
     """
     try:
         project = _load_project(project_id)
@@ -209,6 +211,12 @@ def bootstrap_project(project_id: str) -> dict:
         return {"ok": False, "error": str(e)}
 
     user_id = project.get("user_id", "")
+
+    # Idempotency guard — never run bootstrap twice
+    settings = _load_settings(project_id)
+    if settings and settings.get("bootstrapped"):
+        logger.info(f"[bootstrap] Project {project_id} already bootstrapped — skipping")
+        return {"ok": True, "skipped": True, "reason": "Already bootstrapped"}
 
     # Mark bootstrap as in-progress
     _update_settings(project_id, {"bootstrap_status": "running", "bootstrap_error": None})
@@ -221,6 +229,7 @@ def bootstrap_project(project_id: str) -> dict:
 
     steps = []
     errors = []
+    gemini_unavailable = False  # Set True when Gemini is not configured — not a hard failure
 
     # ── Step 1: Generate 3 ad creatives ──────────────────────
     logger.info(f"[bootstrap] Generating creatives for {project_id}")
@@ -240,7 +249,7 @@ def bootstrap_project(project_id: str) -> dict:
                 if image_url:
                     # Save to creative_generations table
                     db = get_db()
-                    rec = db.table("creative_generations").insert({
+                    db.table("creative_generations").insert({
                         "project_id": project_id,
                         "user_id": user_id,
                         "mode": "fresh",
@@ -266,7 +275,8 @@ def bootstrap_project(project_id: str) -> dict:
                 errors.append(f"Creative generation failed: {e}")
 
     except Exception as e:
-        # Gemini not available — continue without creatives
+        # Gemini not available / not configured — not a hard failure, continue
+        gemini_unavailable = True
         logger.warning(f"[bootstrap] Creative engine unavailable: {e}")
         steps.append({"step": "creatives", "status": "skipped", "detail": "Gemini not configured"})
 
@@ -345,7 +355,8 @@ def bootstrap_project(project_id: str) -> dict:
             errors.append(f"Campaign publish exception: {e}")
 
     # ── Mark bootstrapped ────────────────────────────────────
-    had_critical_error = not creatives_for_campaign and "Gemini not configured" not in str(steps)
+    # A critical error is one where creatives failed for a real reason (not just Gemini unavailable)
+    had_critical_error = not creatives_for_campaign and not gemini_unavailable
     _update_settings(project_id, {
         "bootstrapped": True,
         "bootstrap_status": "error" if had_critical_error else "complete",
@@ -395,7 +406,7 @@ def _extract_body(text: str) -> str:
     """Use first substantive paragraph as body copy."""
     if not text:
         return ""
-    lines = [l.strip() for l in text.split("\n") if l.strip()]
+    lines = [line.strip() for line in text.split("\n") if line.strip()]
     if len(lines) > 1:
         return lines[1][:125]
     return lines[0][:125] if lines else ""
@@ -460,7 +471,7 @@ def run_full_daily(project_id: str) -> dict:
     # ── Bootstrap check: run bootstrap if never done ──────────
     if not settings.get("bootstrapped"):
         logger.info(f"[daily] Project {project_id} not bootstrapped — running bootstrap first")
-        bootstrap_result = bootstrap_project(project_id)
+        bootstrap_project(project_id)
         # Reload settings after bootstrap
         settings = _load_settings(project_id) or settings
 
@@ -568,13 +579,6 @@ def run_full_daily(project_id: str) -> dict:
     budget_actions: list[dict] = recommendations.get("budget_actions", [])[:3]
 
     # ── Step 4: Pause underperforming ads ─────────────────────
-    # Build a map of adset_id → list of active ad info for replacement
-    adset_to_ads: dict[str, list[dict]] = {}
-    for ad_row in (ads or []):
-        aid = ad_row.get("adset_id")
-        if aid:
-            adset_to_ads.setdefault(aid, []).append(ad_row)
-
     for rec in ads_to_pause:
         ad_id = rec.get("ad_id", "")
         ad_name = rec.get("ad_name", "")
@@ -601,7 +605,7 @@ def run_full_daily(project_id: str) -> dict:
         # ── Step 5: Generate replacement creative ──────────────
         if not adset_id:
             continue
-        replacement_url = _generate_replacement(project, project_id, user_id, adset_id, adset_to_ads, summary)
+        replacement_url = _generate_replacement(project, project_id, user_id, adset_id, summary)
 
         # ── Step 6: Upload replacement to Meta as new ad ───────
         if replacement_url and adset_id:
@@ -680,7 +684,6 @@ def _generate_replacement(
     project_id: str,
     user_id: str,
     adset_id: str,
-    adset_to_ads: dict,
     summary: dict,
 ) -> Optional[str]:
     """
@@ -744,7 +747,6 @@ def _get_competitor_ad_url(project_id: str) -> Optional[str]:
             .execute()
         rows = resp.data or []
         if rows:
-            import random
             return random.choice(rows)["image_url"]
     except Exception:
         pass
