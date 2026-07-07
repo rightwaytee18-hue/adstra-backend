@@ -163,8 +163,8 @@ def generate_for_project(project_id: str, mode: str, payload: dict) -> dict:
     from db import get_db
     db = get_db()
 
-    proj = db.table('projects').select('*').eq('id', project_id).single().execute()
-    if not proj.data:
+    proj = db.table('projects').select('*').eq('id', project_id).maybe_single().execute()
+    if not proj or not proj.data:
         return {'error': 'Project not found'}
 
     project = proj.data

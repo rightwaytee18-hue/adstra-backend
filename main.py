@@ -28,6 +28,8 @@ from full_autopilot_engine import (
 )
 
 API_SECRET = os.environ.get("API_SECRET", "")
+if not API_SECRET:
+    raise RuntimeError("API_SECRET environment variable is required — refusing to start without it")
 
 
 @asynccontextmanager
@@ -48,7 +50,7 @@ app.add_middleware(
 
 
 def verify_secret(x_api_secret: str = Header(...)):
-    if API_SECRET and x_api_secret != API_SECRET:
+    if not API_SECRET or x_api_secret != API_SECRET:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
 

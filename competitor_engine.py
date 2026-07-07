@@ -50,8 +50,8 @@ def analyze_ad(client: anthropic.Anthropic, ad: dict) -> dict:
 def run_for_project(project_id: str) -> dict:
     db = get_db()
 
-    proj_resp = db.table('projects').select('id, user_id, competitors').eq('id', project_id).single().execute()
-    if not proj_resp.data:
+    proj_resp = db.table('projects').select('id, user_id, competitors').eq('id', project_id).maybe_single().execute()
+    if not proj_resp or not proj_resp.data:
         return {'scraped': 0, 'error': 'Project not found'}
 
     project = proj_resp.data

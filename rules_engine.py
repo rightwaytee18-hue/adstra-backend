@@ -44,9 +44,9 @@ def run_for_project(project_id: str) -> list[dict]:
     # Load project (need meta token + account id)
     proj_resp = db.table("projects").select(
         "id,meta_access_token,ad_account_id,meta_connected,target_roas,target_cpa,daily_budget_cap"
-    ).eq("id", project_id).single().execute()
+    ).eq("id", project_id).maybe_single().execute()
 
-    project = proj_resp.data
+    project = proj_resp.data if proj_resp else None
     if not project or not project.get("meta_connected") or not project.get("meta_access_token"):
         logger.info(f"Project {project_id} not Meta-connected, skipping.")
         return []

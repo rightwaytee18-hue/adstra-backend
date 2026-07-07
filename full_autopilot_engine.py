@@ -61,8 +61,8 @@ def _get_anthropic() -> anthropic.Anthropic:
 
 def _load_project(project_id: str) -> dict:
     db = get_db()
-    resp = db.table("projects").select("*").eq("id", project_id).single().execute()
-    if not resp.data:
+    resp = db.table("projects").select("*").eq("id", project_id).maybe_single().execute()
+    if not resp or not resp.data:
         raise ValueError(f"Project {project_id} not found")
     return resp.data
 
