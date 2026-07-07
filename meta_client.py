@@ -1,11 +1,34 @@
-import requests
-import json
 import base64
+import json
+import logging
+import random
+import time
 from datetime import datetime, timedelta
 from typing import Optional
 
+import requests
+
+logger = logging.getLogger(__name__)
+
 API_VERSION = "v22.0"
 BASE = f"https://graph.facebook.com/{API_VERSION}"
+
+# Meta Graph API error codes that signal throttling / transient failure and are
+# safe to retry with backoff:
+#   4   = app-level rate limit
+#   17  = user request limit reached
+#   32  = page-level rate limit
+#   613 = custom-level rate limit
+#   80000-80014 = business-use-case (ads) rate limits
+RATE_LIMIT_CODES = {4, 17, 32, 341, 613, 80000, 80001, 80002, 80003, 80004, 80005, 80006, 80008, 80014}
+RATE_LIMIT_SUBCODES = {2446079, 1487742}
+MAX_RETRIES = 4
+BASE_BACKOFF_SECONDS = 2.0
+
+# Meta enforces a per-account minimum daily budget (≈ $1.00 for USD; higher for some
+# currencies/optimization goals). We never write below this so a reduce can't round a
+# budget down to ~0 and silently disable delivery.
+MIN_DAILY_BUDGET_CENTS = 100
 
 
 class MetaClient:
@@ -18,22 +41,98 @@ class MetaClient:
     # Internal helpers                                                     #
     # ------------------------------------------------------------------ #
 
-    def _get(self, endpoint: str, params: dict) -> dict:
-        params["access_token"] = self.token
-        r = requests.get(f"{BASE}/{endpoint}", params=params, timeout=30)
-        return r.json()
+    @staticmethod
+    def _backoff_delay(attempt: int) -> float:
+        """Exponential backoff with full jitter."""
+        return BASE_BACKOFF_SECONDS * (2 ** (attempt - 1)) + random.uniform(0, 1)
 
-    def _post(self, endpoint: str, data: dict) -> dict:
-        """POST to Graph API with full error parsing (prefers user-facing messages)."""
-        data["access_token"] = self.token
-        r = requests.post(f"{BASE}/{endpoint}", data=data, timeout=60)
-        result = r.json()
-        if "error" in result:
-            err = result["error"]
-            # Prefer human-readable message Meta shows to end users
-            msg = err.get("error_user_msg") or err.get("message") or str(err)
-            raise MetaAPIError(msg, code=err.get("code"), subcode=err.get("error_subcode"))
-        return result
+    def _request(self, method: str, endpoint: str, payload: dict, idempotent: bool = False) -> dict:
+        """
+        Single Graph API call with retry/backoff on rate limits and transient errors.
+
+        Retries happen ONLY for GET requests and explicitly idempotent writes
+        (pause, set_budget, set_status). Non-idempotent POSTs — campaign/adset/ad/
+        creative/image creation — are never retried, so a lost response can never
+        silently create a duplicate entity that spends real money.
+
+        Every call is logged. Meta errors AND non-2xx/unparseable responses become
+        MetaAPIError; an unparseable body is never treated as success.
+        """
+        url = f"{BASE}/{endpoint}"
+        can_retry = method == "GET" or idempotent
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                if method == "GET":
+                    params = {**payload, "access_token": self.token}
+                    r = requests.get(url, params=params, timeout=30)
+                else:
+                    data = {**payload, "access_token": self.token}
+                    r = requests.post(url, data=data, timeout=60)
+            except requests.RequestException as e:
+                if can_retry and attempt <= MAX_RETRIES:
+                    delay = self._backoff_delay(attempt)
+                    logger.warning(
+                        f"[meta] {method} {endpoint} network error "
+                        f"(attempt {attempt}/{MAX_RETRIES}): {e} — retrying in {delay:.1f}s"
+                    )
+                    time.sleep(delay)
+                    continue
+                logger.error(f"[meta] {method} {endpoint} network error, giving up: {e}")
+                raise MetaAPIError(f"Network error calling Meta: {e}")
+
+            try:
+                result = r.json()
+            except ValueError:
+                result = None
+
+            error = result.get("error") if isinstance(result, dict) else None
+            if error:
+                code = error.get("code")
+                subcode = error.get("error_subcode")
+                msg = error.get("error_user_msg") or error.get("message") or str(error)
+                retriable = (
+                    r.status_code == 429
+                    or code in RATE_LIMIT_CODES
+                    or subcode in RATE_LIMIT_SUBCODES
+                )
+                if retriable and can_retry and attempt <= MAX_RETRIES:
+                    delay = self._backoff_delay(attempt)
+                    logger.warning(
+                        f"[meta] {method} {endpoint} rate-limited "
+                        f"(code={code} subcode={subcode}, attempt {attempt}/{MAX_RETRIES}) — "
+                        f"backing off {delay:.1f}s"
+                    )
+                    time.sleep(delay)
+                    continue
+                logger.error(f"[meta] {method} {endpoint} failed (code={code} subcode={subcode}): {msg}")
+                raise MetaAPIError(msg, code=code, subcode=subcode)
+
+            # Unparseable body or non-2xx without a structured error (e.g. a 5xx HTML
+            # gateway page). Never treat this as success — retry 5xx for retriable
+            # calls, otherwise raise so callers don't act on empty data.
+            if result is None or r.status_code >= 400:
+                if r.status_code >= 500 and can_retry and attempt <= MAX_RETRIES:
+                    delay = self._backoff_delay(attempt)
+                    logger.warning(
+                        f"[meta] {method} {endpoint} http {r.status_code} "
+                        f"(attempt {attempt}/{MAX_RETRIES}) — retrying in {delay:.1f}s"
+                    )
+                    time.sleep(delay)
+                    continue
+                snippet = (r.text or "")[:200]
+                logger.error(f"[meta] {method} {endpoint} http {r.status_code}, unparseable/empty body: {snippet}")
+                raise MetaAPIError(f"Meta returned HTTP {r.status_code}: {snippet}")
+
+            logger.info(f"[meta] {method} {endpoint} ok (http {r.status_code}, attempt {attempt})")
+            return result
+
+    def _get(self, endpoint: str, params: dict) -> dict:
+        return self._request("GET", endpoint, params)
+
+    def _post(self, endpoint: str, data: dict, idempotent: bool = False) -> dict:
+        return self._request("POST", endpoint, data, idempotent=idempotent)
 
     # ------------------------------------------------------------------ #
     # READ helpers (rules engine)                                         #
@@ -52,19 +151,45 @@ class MetaClient:
         }
         endpoint = endpoint_map[level]
 
-        resp = self._get(endpoint, {
+        # Parent-entity ids are only valid fields on the endpoints that have them.
+        base_fields = "id,name,status,effective_status"
+        if level == "ad":
+            base_fields += ",adset_id,campaign_id"
+        elif level == "adset":
+            base_fields += ",campaign_id"
+
+        params = {
             "fields": (
-                "id,name,status,effective_status,"
+                f"{base_fields},"
                 f"insights.time_range({time_range}){{"
                 "spend,impressions,clicks,ctr,frequency,cpm,"
                 "actions,action_values"
                 "}}"
             ),
             "limit": 200,
-        })
+        }
+
+        # Follow cursor pagination so accounts with >200 entities are not silently
+        # truncated (which would hide ads from analysis and break the CBO map).
+        raw_items: list[dict] = []
+        pages = 0
+        MAX_PAGES = 25  # safety cap → up to ~5000 entities
+        while True:
+            resp = self._get(endpoint, params)
+            raw_items.extend(resp.get("data", []))
+            pages += 1
+            paging = resp.get("paging") or {}
+            after = (paging.get("cursors") or {}).get("after")
+            if not paging.get("next") or not after or pages >= MAX_PAGES:
+                if paging.get("next") and pages >= MAX_PAGES:
+                    logger.warning(
+                        f"[meta] get_insights({level}) hit page cap ({MAX_PAGES}) — results truncated"
+                    )
+                break
+            params = {**params, "after": after}
 
         results = []
-        for item in resp.get("data", []):
+        for item in raw_items:
             if item.get("effective_status") not in ("ACTIVE", "PAUSED"):
                 continue
             ins = (item.get("insights", {}).get("data") or [{}])[0]
@@ -91,6 +216,8 @@ class MetaClient:
                 "id": item["id"],
                 "name": item.get("name", ""),
                 "status": item.get("effective_status", ""),
+                "adset_id": item.get("adset_id"),
+                "campaign_id": item.get("campaign_id"),
                 "spend": spend,
                 "roas": roas,
                 "cpa": cpa,
@@ -103,15 +230,52 @@ class MetaClient:
         return results
 
     def get_adset_budget(self, adset_id: str) -> float:
-        data = self._get(adset_id, {"fields": "daily_budget"})
-        return float(data.get("daily_budget", 0)) / 100
+        return self.get_entity_budget(adset_id)
+
+    def get_entity_budget(self, entity_id: str) -> float:
+        """
+        Read the daily budget (dollars) of any budgeted entity — campaign or ad set.
+
+        Returns 0.0 when the entity carries no own daily budget, e.g. an ad set under
+        a CBO (campaign-budget-optimization) campaign, where the budget lives on the
+        campaign. Callers use this to decide whether a budget change must target the
+        parent campaign instead.
+        """
+        data = self._get(entity_id, {"fields": "daily_budget"})
+        return float(data.get("daily_budget") or 0) / 100
+
+    def get_ad_adset_id(self, ad_id: str) -> Optional[str]:
+        """Return the parent ad-set id for an ad (used to place replacement ads)."""
+        data = self._get(ad_id, {"fields": "adset_id"})
+        return data.get("adset_id")
+
+    def get_budget_info(self, entity_id: str) -> dict:
+        """
+        Return {'daily': dollars, 'lifetime': dollars} for an entity.
+
+        Used to distinguish an ad set with its own budget (ABO, daily OR lifetime)
+        from one under a CBO campaign (both zero) before redirecting a budget change.
+        """
+        data = self._get(entity_id, {"fields": "daily_budget,lifetime_budget"})
+        return {
+            "daily": float(data.get("daily_budget") or 0) / 100,
+            "lifetime": float(data.get("lifetime_budget") or 0) / 100,
+        }
 
     def pause(self, entity_id: str) -> dict:
-        return self._post(entity_id, {"status": "PAUSED"})
+        return self._post(entity_id, {"status": "PAUSED"}, idempotent=True)
 
-    def set_budget(self, adset_id: str, new_budget_dollars: float) -> dict:
-        cents = str(int(new_budget_dollars * 100))
-        return self._post(adset_id, {"daily_budget": cents})
+    def set_status(self, entity_id: str, status: str) -> dict:
+        """Set an entity's status (e.g. 'ACTIVE' to start a replacement ad serving)."""
+        return self._post(entity_id, {"status": status}, idempotent=True)
+
+    def set_budget(self, adset_id: str, new_budget_dollars: float) -> float:
+        # Round (not truncate) to cents and clamp to Meta's minimum so a reduce can't
+        # round a small budget down to ~0 and disable delivery. Returns the actual
+        # dollar amount written so callers log the true value, not the pre-clamp one.
+        cents = max(int(round(new_budget_dollars * 100)), MIN_DAILY_BUDGET_CENTS)
+        self._post(adset_id, {"daily_budget": str(cents)}, idempotent=True)
+        return cents / 100
 
     def scale_budget(self, adset_id: str, pct: float) -> tuple[float, float]:
         old = self.get_adset_budget(adset_id)
@@ -287,13 +451,19 @@ class MetaClient:
         })
         return result["id"]
 
-    def create_ad(self, name: str, adset_id: str, creative_id: str) -> str:
-        """Create a PAUSED ad. Returns ad_id."""
+    def create_ad(self, name: str, adset_id: str, creative_id: str, status: str = "PAUSED") -> str:
+        """
+        Create an ad. Returns ad_id.
+
+        Defaults to PAUSED (used at publish, where the whole campaign launches paused).
+        Autopilot passes status='ACTIVE' for replacement ads so they start serving in
+        the already-live ad set instead of sitting paused.
+        """
         result = self._post(f"{self.account}/ads", {
             "name": name,
             "adset_id": adset_id,
             "creative": json.dumps({"creative_id": creative_id}),
-            "status": "PAUSED",
+            "status": status,
         })
         return result["id"]
 

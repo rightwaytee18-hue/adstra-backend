@@ -30,7 +30,6 @@ Public API:
 import json
 import logging
 import os
-import random
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -116,6 +115,7 @@ def _save_action(
     reasoning: str,
     status: str,
     executed_at: Optional[str] = None,
+    error_detail: Optional[str] = None,
 ) -> str:
     db = get_db()
     payload = {
@@ -133,21 +133,30 @@ def _save_action(
     }
     if executed_at:
         payload["executed_at"] = executed_at
-    resp = db.table("autopilot_actions").insert(payload).select("id").single().execute()
-    return (resp.data or {}).get("id", "")
+    if error_detail:
+        payload["error_detail"] = error_detail
+    resp = db.table("autopilot_actions").insert(payload).execute()
+    rows = resp.data or []
+    return rows[0].get("id", "") if rows else ""
 
 
 # ─────────────────────────────────────────────────────────────
 # PHASE 1: Bootstrap
 # ─────────────────────────────────────────────────────────────
 
+# NOTE: condition vocabulary MUST match rules_engine._meets_condition / run_for_project:
+#   op    -> "less_than" | "greater_than" | "equals"
+#   value -> numeric threshold (read via cond["value"])
+#   metric in rules_engine.METRIC_KEYS, plus window_days
+# and `action` must be one the rules engine handles ("pause", "scale_budget",
+# "reduce_budget", "send_alert"). Anything else is silently ignored at run time.
 DEFAULT_RULES = [
     {
         "name": "🛡️ Kill: Low ROAS after spend",
         "level": "adset",
         "conditions": [
-            {"metric": "roas", "op": "lt", "threshold": 0.5, "window_days": 7},
-            {"metric": "spend", "op": "gt", "threshold": 50, "window_days": 7},
+            {"metric": "roas", "op": "less_than", "value": 0.5, "window_days": 7},
+            {"metric": "spend", "op": "greater_than", "value": 50, "window_days": 7},
         ],
         "action": "pause",
         "action_value": None,
@@ -156,8 +165,8 @@ DEFAULT_RULES = [
         "name": "🚀 Scale: High ROAS winner",
         "level": "adset",
         "conditions": [
-            {"metric": "roas", "op": "gt", "threshold": 4.0, "window_days": 7},
-            {"metric": "spend", "op": "gt", "threshold": 20, "window_days": 7},
+            {"metric": "roas", "op": "greater_than", "value": 4.0, "window_days": 7},
+            {"metric": "spend", "op": "greater_than", "value": 20, "window_days": 7},
         ],
         "action": "scale_budget",
         "action_value": 20,
@@ -166,8 +175,8 @@ DEFAULT_RULES = [
         "name": "⚠️ Reduce: Negative ROAS",
         "level": "adset",
         "conditions": [
-            {"metric": "roas", "op": "lt", "threshold": 1.0, "window_days": 3},
-            {"metric": "spend", "op": "gt", "threshold": 30, "window_days": 3},
+            {"metric": "roas", "op": "less_than", "value": 1.0, "window_days": 3},
+            {"metric": "spend", "op": "greater_than", "value": 30, "window_days": 3},
         ],
         "action": "reduce_budget",
         "action_value": 25,
@@ -176,9 +185,9 @@ DEFAULT_RULES = [
         "name": "📉 Alert: High frequency",
         "level": "adset",
         "conditions": [
-            {"metric": "frequency", "op": "gt", "threshold": 4.0, "window_days": 7},
+            {"metric": "frequency", "op": "greater_than", "value": 4.0, "window_days": 7},
         ],
-        "action": "alert",
+        "action": "send_alert",
         "action_value": None,
     },
 ]
@@ -290,10 +299,13 @@ def bootstrap_project(project_id: str) -> dict:
                 "user_id": user_id,
                 "name": rule["name"],
                 "level": rule["level"],
-                "conditions": json.dumps(rule["conditions"]),
+                "status": "active",
+                # conditions is a jsonb column — pass the list directly so it is
+                # stored as a JSON array (json.dumps would store a JSON string scalar
+                # that rules_engine cannot iterate).
+                "conditions": rule["conditions"],
                 "action": rule["action"],
                 "action_value": rule["action_value"],
-                "enabled": True,
             }).execute()
         steps.append({"step": "default_rules", "status": "ok", "detail": f"{len(DEFAULT_RULES)} rules created"})
         logger.info(f"[bootstrap] {len(DEFAULT_RULES)} default rules created")
@@ -326,7 +338,7 @@ def bootstrap_project(project_id: str) -> dict:
                 "age_min": project.get("target_age_min") or 18,
                 "age_max": project.get("target_age_max") or 65,
                 "gender": project.get("target_gender") or "all",
-                "daily_budget_cents": int((project.get("daily_budget_usd") or 50) * 100),
+                "daily_budget_cents": int((project.get("daily_budget_cap") or 50) * 100),
                 "budget_mode": "cbo",
                 "bid_strategy": "LOWEST_COST_WITHOUT_CAP",
                 "link_url": store_url,
@@ -417,9 +429,10 @@ def _extract_body(text: str) -> str:
 # ─────────────────────────────────────────────────────────────
 
 DAILY_SYSTEM_PROMPT = """\
-You are Adstra's autonomous ad optimizer. You receive ad-level performance data and project targets.
+You are Adstra's autonomous ad optimizer. You receive ad-level, adset-level, and
+campaign-level performance data plus project targets.
 
-Your job: identify SPECIFIC ads to pause AND specific adsets to scale or reduce.
+Your job: identify SPECIFIC ads to pause AND specific adsets/campaigns to scale or reduce.
 
 Return ONLY a JSON object with two keys:
 {
@@ -427,7 +440,7 @@ Return ONLY a JSON object with two keys:
     {"ad_id": "...", "ad_name": "...", "adset_id": "...", "reasoning": "1 sentence"}
   ],
   "budget_actions": [
-    {"entity_id": "...", "entity_name": "...", "entity_level": "adset", "action": "scale_budget"|"reduce_budget"|"pause", "pct": 20, "reasoning": "1 sentence"}
+    {"entity_id": "...", "entity_name": "...", "entity_level": "adset"|"campaign", "action": "scale_budget"|"reduce_budget"|"pause", "pct": 20, "reasoning": "1 sentence"}
   ]
 }
 
@@ -437,10 +450,13 @@ Rules for pausing ads:
 - Only pause up to 3 ads per run
 
 Rules for budget actions:
-- Scale adset if ROAS >= scale_roas_min AND spend >= $20
-- Reduce adset if ROAS <= kill_roas_max AND spend >= kill_spend_min
+- Scale if ROAS >= scale_roas_min AND spend >= $20
+- Reduce if ROAS <= kill_roas_max AND spend >= kill_spend_min
 - Never exceed max_daily_budget_usd
 - Max 3 budget actions per run
+- Budget lives on the AD SET for ABO campaigns and on the CAMPAIGN for CBO campaigns.
+  Prefer the entity that actually holds the budget. If you target an ad set whose
+  campaign uses CBO, the system will automatically apply the change at the campaign level.
 
 If nothing needs changing, return {"ads_to_pause": [], "budget_actions": []}
 """
@@ -483,11 +499,13 @@ def run_full_daily(project_id: str) -> dict:
     max_daily_budget = float(settings.get("max_daily_budget_usd") or 500.0)
     approval_mode = settings.get("approval_mode", "manual")
 
-    meta = MetaClient(token, account)
+    # page_id is REQUIRED to create ad creatives for replacement ads.
+    meta = MetaClient(token, account, page_id=project.get("facebook_page_id"))
     summary = {
         "project_id": project_id,
         "competitor_ads_scraped": 0,
         "ads_paused": 0,
+        "ads_pause_queued": 0,
         "creatives_generated": 0,
         "ads_created": 0,
         "budget_actions_taken": 0,
@@ -510,6 +528,7 @@ def run_full_daily(project_id: str) -> dict:
     try:
         ads = meta.get_insights("ad", window_days)
         adsets = meta.get_insights("adset", window_days)
+        campaigns = meta.get_insights("campaign", window_days)
     except Exception as e:
         logger.error(f"[daily] Meta insights failed: {e}")
         summary["errors"].append(f"Meta insights: {e}")
@@ -518,6 +537,10 @@ def run_full_daily(project_id: str) -> dict:
     if not ads and not adsets:
         summary["skipped_reason"] = "No active ads or ad sets"
         return summary
+
+    # Map each ad set to its parent campaign so budget actions can be redirected
+    # to the campaign when the campaign uses CBO (ad set has no own budget).
+    adset_to_campaign = {a.get("id"): a.get("campaign_id") for a in (adsets or []) if a.get("id")}
 
     # ── Step 3: Claude analysis ───────────────────────────────
     snapshot = {
@@ -545,6 +568,8 @@ def run_full_daily(project_id: str) -> dict:
             {
                 "entity_id": a.get("id"),
                 "entity_name": a.get("name"),
+                "entity_level": "adset",
+                "campaign_id": a.get("campaign_id"),
                 "roas": round(float(a.get("roas") or 0), 2),
                 "cpa": round(float(a.get("cpa") or 0), 2),
                 "spend": round(float(a.get("spend") or 0), 2),
@@ -553,8 +578,24 @@ def run_full_daily(project_id: str) -> dict:
             }
             for a in (adsets or [])
         ],
+        "campaigns": [
+            {
+                "entity_id": c.get("id"),
+                "entity_name": c.get("name"),
+                "entity_level": "campaign",
+                "roas": round(float(c.get("roas") or 0), 2),
+                "cpa": round(float(c.get("cpa") or 0), 2),
+                "spend": round(float(c.get("spend") or 0), 2),
+                "status": c.get("status"),
+            }
+            for c in (campaigns or [])
+        ],
     }
 
+    logger.info(
+        f"[daily] {project_id} sending {len(snapshot['ads'])} ads / "
+        f"{len(snapshot['adsets'])} adsets to Claude ({MODEL})"
+    )
     try:
         client = _get_anthropic()
         msg = client.messages.create(
@@ -564,6 +605,8 @@ def run_full_daily(project_id: str) -> dict:
             messages=[{"role": "user", "content": json.dumps(snapshot, indent=2)}],
         )
         raw = (msg.content[0].text if msg.content else "{}").strip()
+        # Observability: record the model's raw decision before parsing.
+        logger.info(f"[daily] {project_id} Claude raw decision: {raw[:2000]}")
         if raw.startswith("```"):
             raw = raw.split("```")[1]
             if raw.startswith("json"):
@@ -577,8 +620,24 @@ def run_full_daily(project_id: str) -> dict:
 
     ads_to_pause: list[dict] = recommendations.get("ads_to_pause", [])[:3]
     budget_actions: list[dict] = recommendations.get("budget_actions", [])[:3]
+    logger.info(
+        f"[daily] {project_id} Claude decision parsed: "
+        f"{len(ads_to_pause)} ad(s) to pause, {len(budget_actions)} budget action(s) "
+        f"(approval_mode={approval_mode})"
+    )
+
+    # Ad sets a budget action will pause this run — don't create a replacement ad
+    # inside an ad set we're about to pause.
+    pause_target_entities = {
+        rec.get("entity_id")
+        for rec in budget_actions
+        if rec.get("action") == "pause" and rec.get("entity_id")
+    }
 
     # ── Step 4: Pause underperforming ads ─────────────────────
+    # In manual mode the pause (and its replacement) is queued for the user to
+    # approve; on approval execute_approved_action pauses the ad and creates the
+    # replacement. In auto mode it runs immediately here.
     for rec in ads_to_pause:
         ad_id = rec.get("ad_id", "")
         ad_name = rec.get("ad_name", "")
@@ -586,6 +645,15 @@ def run_full_daily(project_id: str) -> dict:
         reasoning = rec.get("reasoning", "")
 
         if not ad_id:
+            continue
+
+        if approval_mode != "auto":
+            _save_action(
+                project_id, user_id, "pause", ad_id, ad_name, "ad",
+                "roas/ctr", None, None, reasoning, "pending",
+            )
+            summary["ads_pause_queued"] += 1
+            logger.info(f"[daily] Queued pause on {ad_name} ({ad_id}) for approval")
             continue
 
         try:
@@ -601,9 +669,10 @@ def run_full_daily(project_id: str) -> dict:
         except Exception as e:
             logger.warning(f"[daily] Pause failed for {ad_id}: {e}")
             summary["errors"].append(f"Pause {ad_name}: {e}")
+            continue
 
         # ── Step 5: Generate replacement creative ──────────────
-        if not adset_id:
+        if not adset_id or adset_id in pause_target_entities:
             continue
         replacement_url = _generate_replacement(project, project_id, user_id, adset_id, summary)
 
@@ -626,9 +695,28 @@ def run_full_daily(project_id: str) -> dict:
         if not entity_id or action_type not in ("scale_budget", "reduce_budget", "pause"):
             continue
 
+        # Pausing an entire campaign autonomously halts all its delivery — too
+        # high-impact to ride the budget-action path. Skip it.
+        if action_type == "pause" and entity_level == "campaign":
+            logger.warning(
+                f"[daily] Skipping campaign-level pause on {entity_name} ({entity_id}) — "
+                f"too high-impact for autonomous execution"
+            )
+            summary["errors"].append(f"Skipped campaign pause {entity_name} (needs manual action)")
+            continue
+
+        # Redirect ad-set budget changes to the parent campaign when the campaign
+        # uses CBO. Resolved before queueing so a queued action approved later
+        # targets the correct entity.
+        if entity_level == "adset" and action_type in ("scale_budget", "reduce_budget"):
+            entity_id, entity_level, entity_name, reasoning = _resolve_budget_target(
+                meta, entity_id, entity_name, reasoning, adset_to_campaign
+            )
+
         if approval_mode == "auto":
             _execute_budget_action(meta, entity_id, entity_name, entity_level,
-                                   action_type, pct, project_id, user_id, reasoning, summary)
+                                   action_type, pct, project_id, user_id, reasoning, summary,
+                                   max_daily_budget=max_daily_budget)
         else:
             # Queue for user approval
             _save_action(
@@ -636,11 +724,12 @@ def run_full_daily(project_id: str) -> dict:
                 entity_level, "roas", None, None, reasoning, "pending",
             )
             summary["budget_actions_queued"] += 1
-            logger.info(f"[daily] Queued {action_type} on {entity_name}")
+            logger.info(f"[daily] Queued {action_type} on {entity_name} ({entity_level})")
 
     # ── Summary notification ──────────────────────────────────
     total_changes = (
         summary["ads_paused"] +
+        summary["ads_pause_queued"] +
         summary["ads_created"] +
         summary["budget_actions_taken"] +
         summary["budget_actions_queued"]
@@ -659,21 +748,22 @@ def run_full_daily(project_id: str) -> dict:
                 "/autopilot",
             )
         else:
-            queued = summary["budget_actions_queued"]
+            queued = summary["ads_pause_queued"] + summary["budget_actions_queued"]
             _create_notification(
                 user_id, project_id, "action",
-                f"{queued} budget action{'s' if queued != 1 else ''} need your approval",
+                f"{queued} autopilot action{'s' if queued != 1 else ''} need your approval",
                 (
-                    f"Adstra paused {summary['ads_paused']} ads and "
-                    f"launched {summary['ads_created']} new creatives automatically. "
-                    f"Review budget decisions in Autopilot."
+                    f"Adstra recommends pausing {summary['ads_pause_queued']} ad(s) and "
+                    f"{summary['budget_actions_queued']} budget change(s). "
+                    f"Approve them in Autopilot to apply (replacements are created on approval)."
                 ),
                 "/autopilot",
             )
 
     logger.info(
         f"[daily] {project_id} — paused={summary['ads_paused']}, "
-        f"new_ads={summary['ads_created']}, budget_taken={summary['budget_actions_taken']}, "
+        f"pause_queued={summary['ads_pause_queued']}, new_ads={summary['ads_created']}, "
+        f"budget_taken={summary['budget_actions_taken']}, "
         f"budget_queued={summary['budget_actions_queued']}"
     )
     return summary
@@ -687,69 +777,40 @@ def _generate_replacement(
     summary: dict,
 ) -> Optional[str]:
     """
-    Generate a replacement creative. Tries competitor iteration first,
-    falls back to fresh generation. Returns image_url or None.
+    Generate a fresh replacement creative. Returns image_url or None.
+
+    (Competitor-image iteration is not used here: competitor_ads stores an
+    ad-library snapshot page link, not a usable image URL.)
     """
     try:
         from creative_engine import NanaBanana
         banana = NanaBanana(get_db())
 
-        # Try to grab a competitor ad URL for iteration
-        competitor_url = _get_competitor_ad_url(project_id)
-
-        if competitor_url:
-            image_url, ad_text = banana.iterate_competitor(
-                project,
-                competitor_url,
-                "Create a higher-converting version for our brand",
-            )
-            mode = "iterate"
-        else:
-            image_url, ad_text = banana.generate_fresh(
-                project,
-                "Fresh high-converting creative optimized for performance. Bold hook, clear CTA.",
-                project.get("business_name", ""),
-            )
-            mode = "fresh"
+        image_url, ad_text = banana.generate_fresh(
+            project,
+            "Fresh high-converting creative optimized for performance. Bold hook, clear CTA.",
+            project.get("business_name", ""),
+        )
 
         if image_url:
             db = get_db()
             db.table("creative_generations").insert({
                 "project_id": project_id,
                 "user_id": user_id,
-                "mode": mode,
+                "mode": "fresh",
                 "prompt": f"Autopilot replacement for adset {adset_id}",
                 "image_url": image_url,
                 "is_saved": True,
                 "metadata": {"text": ad_text, "autopilot": True, "adset_id": adset_id},
             }).execute()
             summary["creatives_generated"] += 1
-            logger.info(f"[daily] Replacement creative generated ({mode}): {image_url[:60]}")
+            logger.info(f"[daily] Replacement creative generated: {image_url[:60]}")
             return image_url
 
     except Exception as e:
         logger.warning(f"[daily] Creative generation failed (non-fatal): {e}")
         summary["errors"].append(f"Creative gen: {e}")
 
-    return None
-
-
-def _get_competitor_ad_url(project_id: str) -> Optional[str]:
-    """Get a recent competitor ad image URL to iterate on."""
-    try:
-        db = get_db()
-        resp = db.table("competitor_ads") \
-            .select("image_url") \
-            .eq("project_id", project_id) \
-            .not_.is_("image_url", "null") \
-            .order("scraped_at", desc=True) \
-            .limit(10) \
-            .execute()
-        rows = resp.data or []
-        if rows:
-            return random.choice(rows)["image_url"]
-    except Exception:
-        pass
     return None
 
 
@@ -782,7 +843,9 @@ def _upload_and_create_ad(
         )
 
         ad_name = f"Autopilot — Replacement {timestamp_label}"
-        ad_id = meta.create_ad(name=ad_name, adset_id=adset_id, creative_id=creative_id)
+        # Start the replacement ACTIVE — the ad set is already live, so a PAUSED
+        # replacement would never serve (defeating the point of replacing a loser).
+        ad_id = meta.create_ad(name=ad_name, adset_id=adset_id, creative_id=creative_id, status="ACTIVE")
 
         summary["ads_created"] += 1
         _save_action(
@@ -799,6 +862,56 @@ def _upload_and_create_ad(
         summary["errors"].append(f"Create ad: {e}")
 
 
+def _resolve_budget_target(
+    meta: MetaClient,
+    entity_id: str,
+    entity_name: str,
+    reasoning: str,
+    adset_to_campaign: dict,
+) -> tuple[str, str, str, str]:
+    """
+    Decide which entity a budget change should target.
+
+    If an ad set has its own daily budget (ABO) the action stays on the ad set.
+    If it has none (CBO — budget lives on the campaign), redirect to the parent
+    campaign so the change actually takes effect instead of zeroing the ad set.
+
+    Returns (entity_id, entity_level, entity_name, reasoning).
+    """
+    try:
+        info = meta.get_budget_info(entity_id)
+    except Exception as e:
+        logger.warning(f"[daily] Could not read budget for ad set {entity_id}: {e}")
+        return entity_id, "adset", entity_name, reasoning
+
+    # ABO with a daily budget → scale the ad set directly.
+    if info["daily"] > 0:
+        return entity_id, "adset", entity_name, reasoning
+    # ABO with a lifetime budget → not a CBO. Daily scaling does not apply; leave it
+    # on the ad set and let _execute_budget_action's $0-daily guard refuse, rather
+    # than wrongly redirecting a lifetime-budget ad set to the campaign.
+    if info["lifetime"] > 0:
+        logger.info(f"[daily] Ad set {entity_id} uses a lifetime budget — skipping daily-budget change")
+        return entity_id, "adset", entity_name, reasoning
+
+    campaign_id = adset_to_campaign.get(entity_id)
+    if campaign_id:
+        logger.info(
+            f"[daily] Ad set {entity_id} has no own budget (CBO) — "
+            f"redirecting budget action to campaign {campaign_id}"
+        )
+        return (
+            campaign_id,
+            "campaign",
+            f"{entity_name} (campaign budget)",
+            reasoning + " [applied at campaign level — campaign uses CBO]",
+        )
+
+    # No parent mapping available — leave on the ad set; the guard in
+    # _execute_budget_action will refuse a $0 budget rather than do damage.
+    return entity_id, "adset", entity_name, reasoning
+
+
 def _execute_budget_action(
     meta: MetaClient,
     entity_id: str,
@@ -810,19 +923,38 @@ def _execute_budget_action(
     user_id: str,
     reasoning: str,
     summary: dict,
+    max_daily_budget: Optional[float] = None,
 ) -> None:
-    """Execute a budget action immediately (auto mode)."""
+    """Execute a budget action immediately (auto mode), enforcing the spend ceiling."""
     value_before = None
     value_after = None
     exec_status = "executed"
+    error_detail = None
 
     try:
-        if action_type == "scale_budget":
-            old, new = meta.scale_budget(entity_id, pct)
-            value_before, value_after = old, new
-        elif action_type == "reduce_budget":
-            old, new = meta.reduce_budget(entity_id, pct)
-            value_before, value_after = old, new
+        if action_type in ("scale_budget", "reduce_budget"):
+            current = meta.get_entity_budget(entity_id)
+            # A zero budget here means the entity carries no own budget (e.g. an ad
+            # set under a CBO campaign that was not redirected). Scaling $0 would set
+            # spend to $0 and effectively kill it — refuse rather than do damage.
+            if current <= 0:
+                raise MetaAPIError(
+                    "Ad set has no own daily budget (campaign uses CBO) — "
+                    "budget must be changed at the campaign level"
+                )
+            if action_type == "scale_budget":
+                new = current * (1 + pct / 100)
+                # Never exceed the configured spend ceiling.
+                if max_daily_budget and new > max_daily_budget:
+                    logger.info(
+                        f"[daily] Capping scale on {entity_name}: "
+                        f"{new:.2f} → max {max_daily_budget:.2f}"
+                    )
+                    new = max_daily_budget
+            else:
+                new = current * (1 - pct / 100)
+            written = meta.set_budget(entity_id, new)
+            value_before, value_after = round(current, 2), round(written, 2)
         elif action_type == "pause":
             meta.pause(entity_id)
 
@@ -830,6 +962,7 @@ def _execute_budget_action(
         logger.info(f"[daily] {action_type} on {entity_name}: {value_before} → {value_after}")
     except Exception as e:
         exec_status = "failed"
+        error_detail = str(e)
         logger.error(f"[daily] Budget action {action_type} failed: {e}")
         summary["errors"].append(f"{action_type} {entity_name}: {e}")
 
@@ -837,6 +970,7 @@ def _execute_budget_action(
         project_id, user_id, action_type, entity_id, entity_name,
         entity_level, "roas", value_before, value_after, reasoning, exec_status,
         executed_at=datetime.now(timezone.utc).isoformat() if exec_status == "executed" else None,
+        error_detail=error_detail,
     )
 
 
