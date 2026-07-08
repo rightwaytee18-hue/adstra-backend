@@ -4,7 +4,7 @@ _FastAPI engines for adstra-app (deployed on Railway, APScheduler crons)._
 
 ## Status (2026-06-21): full_autopilot_engine hardened
 
-Done this pass (grounded against live Supabase `iuhabzdacuwbrprnfuqo`):
+Done this pass (grounded against the live Supabase project):
 - **Bootstrap rules now insert correctly** — was writing a nonexistent `enabled`
   column + double-encoding `conditions` + using op/value vocab the rules engine
   can't read. Fixed to `status`/jsonb list/`less_than`-`greater_than`/`value`/`send_alert`.
