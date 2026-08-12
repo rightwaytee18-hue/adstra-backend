@@ -1,6 +1,12 @@
 [build]
 builder = "nixpacks"
-buildCommand = "pip install -r requirements.txt && playwright install chromium --with-deps"
+# pip install is required and fatal. The chromium install is best-effort: it is
+# only used by the competitor scraper (scraper.py imports playwright lazily and
+# raises a caught error if the browser is absent), so a failed browser install
+# must NOT take down the autopilot, Meta and rules endpoints with it. Dropped
+# --with-deps because that apt step needs root and is the usual reason this
+# build died.
+buildCommand = "pip install -r requirements.txt && (playwright install chromium || echo 'chromium install skipped; competitor scraping will be unavailable until it succeeds')"
 
 [deploy]
 startCommand = "uvicorn main:app --host 0.0.0.0 --port $PORT"
