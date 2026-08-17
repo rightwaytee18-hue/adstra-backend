@@ -35,13 +35,27 @@ from typing import Optional
 
 import anthropic
 
+import guards
+from crypto import token_for
 from db import get_db
 from meta_client import MetaClient, MetaAPIError
+from snapshots import write_daily_snapshot
 
 logger = logging.getLogger(__name__)
 
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 MODEL = "claude-sonnet-4-6"
+
+# Hard ceiling on a single budget increase, regardless of what the settings row
+# says. Meta restarts an ad set's learning phase on a budget edit, and the
+# published guidance is not to exceed roughly 20 percent per change. A customer
+# who types 200 into the box would otherwise reset their own campaign daily.
+MAX_SCALE_PCT = 20.0
+
+# DRY_RUN logs every decision and makes no Meta call that changes anything.
+# There was no such flag, so the only way to see what the engine would do to a
+# real account was to let it do it.
+DRY_RUN = os.environ.get("AUTOPILOT_DRY_RUN", "").lower() in ("1", "true", "yes")
 
 _anthropic_client: Optional[anthropic.Anthropic] = None
 
@@ -152,7 +166,7 @@ def _save_action(
 # "reduce_budget", "send_alert"). Anything else is silently ignored at run time.
 DEFAULT_RULES = [
     {
-        "name": "🛡️ Kill: Low ROAS after spend",
+        "name": "Switch off ads that lose money",
         "level": "adset",
         "conditions": [
             {"metric": "roas", "op": "less_than", "value": 0.5, "window_days": 7},
@@ -162,7 +176,7 @@ DEFAULT_RULES = [
         "action_value": None,
     },
     {
-        "name": "🚀 Scale: High ROAS winner",
+        "name": "Put more behind what is working",
         "level": "adset",
         "conditions": [
             {"metric": "roas", "op": "greater_than", "value": 4.0, "window_days": 7},
@@ -172,7 +186,7 @@ DEFAULT_RULES = [
         "action_value": 20,
     },
     {
-        "name": "⚠️ Reduce: Negative ROAS",
+        "name": "Spend less on what is not paying off",
         "level": "adset",
         "conditions": [
             {"metric": "roas", "op": "less_than", "value": 1.0, "window_days": 3},
@@ -182,7 +196,7 @@ DEFAULT_RULES = [
         "action_value": 25,
     },
     {
-        "name": "📉 Alert: High frequency",
+        "name": "Tell me when people see an ad too often",
         "level": "adset",
         "conditions": [
             {"metric": "frequency", "op": "greater_than", "value": 4.0, "window_days": 7},
@@ -231,7 +245,7 @@ def bootstrap_project(project_id: str) -> dict:
     _update_settings(project_id, {"bootstrap_status": "running", "bootstrap_error": None})
     _create_notification(
         user_id, project_id, "info",
-        "Adstra Autopilot is warming up 🚀",
+        "Getting your ads ready",
         "Generating your first creatives and setting up your campaign. This takes ~2 minutes.",
         "/autopilot",
     )
@@ -319,7 +333,7 @@ def bootstrap_project(project_id: str) -> dict:
         # Can't publish without creatives — skip but don't fail
         steps.append({"step": "campaign", "status": "skipped", "detail": "No creatives available"})
         logger.warning(f"[bootstrap] No creatives — skipping campaign publish for {project_id}")
-    elif not project.get("meta_connected") or not project.get("meta_access_token"):
+    elif not project.get("meta_connected") or not token_for(project):
         steps.append({"step": "campaign", "status": "skipped", "detail": "Meta not connected"})
         logger.warning(f"[bootstrap] Meta not connected — skipping campaign publish for {project_id}")
     else:
@@ -380,8 +394,8 @@ def bootstrap_project(project_id: str) -> dict:
     if campaign_step and campaign_step["status"] == "ok":
         _create_notification(
             user_id, project_id, "success",
-            "🎉 Your first campaign is live!",
-            f"Adstra created 3 ad creatives, {len(DEFAULT_RULES)} protection rules, and published your first campaign. Autopilot is now running.",
+            "Your first ads are ready",
+            f"We built 3 ads for you and set up {len(DEFAULT_RULES)} rules that protect your budget. Nothing is spending yet, and we will ask you before anything goes live.",
             "/autopilot",
         )
     else:
@@ -428,37 +442,115 @@ def _extract_body(text: str) -> str:
 # PHASE 2: Daily Optimization
 # ─────────────────────────────────────────────────────────────
 
-DAILY_SYSTEM_PROMPT = """\
-You are Adstra's autonomous ad optimizer. You receive ad-level, adset-level, and
-campaign-level performance data plus project targets.
+def _daily_system_prompt(goal: str, s: dict) -> str:
+    """
+    Build the decision prompt from THIS project's settings.
 
-Your job: identify SPECIFIC ads to pause AND specific adsets/campaigns to scale or reduce.
+    ⚠️ This used to be a module-level constant carrying literals: "pause if ROAS
+    < 0.5", "spend > $20". Those literals sat next to a settings object that also
+    defined kill_roas_max (default 0.8) and were handed to the model together, so
+    the customer's own threshold was quietly overridden by a number nobody could
+    see or change. Every threshold now comes from the row.
+
+    ⚠️ And the whole prompt assumed an ecommerce advertiser. A lead-gen account
+    has no ROAS at all, so the purchase-shaped version of these rules told the
+    model to pause everything. The goal decides which rules it even sees.
+    """
+    scale_roas_min = float(s.get("scale_roas_min") or 3.0)
+    kill_roas_max = float(s.get("kill_roas_max") or 0.8)
+    kill_spend_min = float(s.get("kill_spend_min") or 50.0)
+    max_daily = float(s.get("max_daily_budget_usd") or 500.0)
+    max_account_daily = float(s.get("max_account_daily_usd") or 1000.0)
+    min_conv = int(s.get("min_conversions_to_scale") or 50)
+    cooldown = int(s.get("scale_cooldown_hours") or 72)
+    target_cpr = s.get("target_cost_per_result")
+
+    if goal == "purchase":
+        performance_rules = f"""\
+This account sells products, so ROAS is real and is the primary signal.
+
+Pause an ad when:
+- ROAS is below {kill_roas_max} AND spend is at least ${kill_spend_min:.0f}
+- or CTR is below 0.5% AND spend is at least ${kill_spend_min:.0f}
+
+Budget:
+- Scale when ROAS is at or above {scale_roas_min} and spend is at least ${kill_spend_min:.0f}
+- Reduce when ROAS is at or below {kill_roas_max} and spend is at least ${kill_spend_min:.0f}"""
+    elif goal == "lead":
+        cpr_line = (
+            f"The customer's target cost per enquiry is ${float(target_cpr):.2f}."
+            if target_cpr
+            else
+            "The customer has not set a target cost per enquiry, so compare each "
+            "entity against the account average rather than an absolute number."
+        )
+        performance_rules = f"""\
+This account does NOT sell products online. It generates enquiries: form fills,
+phone taps and messages. There is no ROAS and no revenue. The `roas` field will
+be null on every row and you must IGNORE it completely rather than treat null as
+zero. The number that matters is `cost_per_result`, in dollars per enquiry.
+
+{cpr_line}
+
+Pause an ad when:
+- It has spent at least ${kill_spend_min:.0f} and produced ZERO results
+- or its cost_per_result is more than twice the account average, on at least
+  ${kill_spend_min:.0f} of spend
+
+Budget:
+- Scale when cost_per_result is comfortably below the account average and the
+  entity has at least {min_conv} results in the window
+- Reduce when cost_per_result is well above the account average on meaningful spend
+
+An entity with zero spend has not been tested. Never pause it and never scale it."""
+    else:
+        performance_rules = """\
+This account is running an awareness campaign. There are no purchases and no
+enquiries to count, so do NOT pause anything for a lack of conversions. Judge
+only on reach efficiency: CPM and frequency. Recommend a pause only when
+frequency is above 4.0, which means the same people are being shown the ad over
+and over."""
+
+    return f"""\
+You are an autonomous ad optimizer working on one advertiser's account. You
+receive ad-level, adset-level and campaign-level performance plus their targets.
+
+Identify SPECIFIC ads to pause AND specific adsets or campaigns to scale or reduce.
 
 Return ONLY a JSON object with two keys:
-{
+{{
   "ads_to_pause": [
-    {"ad_id": "...", "ad_name": "...", "adset_id": "...", "reasoning": "1 sentence"}
+    {{"ad_id": "...", "ad_name": "...", "adset_id": "...", "reasoning": "1 sentence"}}
   ],
   "budget_actions": [
-    {"entity_id": "...", "entity_name": "...", "entity_level": "adset"|"campaign", "action": "scale_budget"|"reduce_budget"|"pause", "pct": 20, "reasoning": "1 sentence"}
+    {{"entity_id": "...", "entity_name": "...", "entity_level": "adset"|"campaign", "action": "scale_budget"|"reduce_budget"|"pause", "pct": 20, "reasoning": "1 sentence"}}
   ]
-}
+}}
 
-Rules for pausing ads:
-- Pause if CTR < 0.5% AND spend > $20
-- Pause if ROAS < 0.5 AND spend > $30
-- Only pause up to 3 ads per run
+{performance_rules}
 
-Rules for budget actions:
-- Scale if ROAS >= scale_roas_min AND spend >= $20
-- Reduce if ROAS <= kill_roas_max AND spend >= kill_spend_min
-- Never exceed max_daily_budget_usd
-- Max 3 budget actions per run
-- Budget lives on the AD SET for ABO campaigns and on the CAMPAIGN for CBO campaigns.
-  Prefer the entity that actually holds the budget. If you target an ad set whose
-  campaign uses CBO, the system will automatically apply the change at the campaign level.
+Hard limits that apply to every goal:
+- Never pause more than 3 ads in one run
+- Never take more than 3 budget actions in one run
+- Never take a single entity's daily budget above ${max_daily:.0f}
+- The whole account must stay at or below ${max_account_daily:.0f} per day
+- Never propose a budget increase above 20 percent. Meta puts an ad set back
+  into its learning phase on a budget edit, and a bigger jump costs more in lost
+  delivery than the extra budget gains. Increases are spaced {cooldown} hours apart
+  and the system will reject one that comes too soon.
+- Do not touch an entity that is still learning. An entity with fewer than
+  {min_conv} results in the window has not produced a reliable signal yet, so
+  leave its budget alone even if the early numbers look good or bad.
+- Budget lives on the AD SET for ABO campaigns and on the CAMPAIGN for CBO
+  campaigns. Prefer the entity that actually holds the budget. If you target an
+  ad set whose campaign uses CBO, the system applies the change at campaign level.
 
-If nothing needs changing, return {"ads_to_pause": [], "budget_actions": []}
+Write every `reasoning` in plain language a small business owner would
+understand, with no jargon. The customer reads this sentence and approves or
+rejects it. Say "this ad cost $61 per enquiry when the rest of the account
+averages $22", not "CPA exceeds threshold".
+
+If nothing needs changing, return {{"ads_to_pause": [], "budget_actions": []}}
 """
 
 
@@ -474,7 +566,7 @@ def run_full_daily(project_id: str) -> dict:
         return {"project_id": project_id, "skipped_reason": str(e)}
 
     user_id = project.get("user_id", "")
-    token = project.get("meta_access_token")
+    token = token_for(project)
     account = project.get("ad_account_id")
 
     if not token or not account or not project.get("meta_connected"):
@@ -495,9 +587,28 @@ def run_full_daily(project_id: str) -> dict:
     scale_roas_min = float(settings.get("scale_roas_min") or 3.0)
     kill_roas_max = float(settings.get("kill_roas_max") or 0.8)
     kill_spend_min = float(settings.get("kill_spend_min") or 50.0)
-    scale_pct = float(settings.get("scale_pct") or 20.0)
     max_daily_budget = float(settings.get("max_daily_budget_usd") or 500.0)
+    max_account_daily = float(settings.get("max_account_daily_usd") or 1000.0)
+    min_conversions_to_scale = int(settings.get("min_conversions_to_scale") or 50)
+    scale_cooldown_hours = int(settings.get("scale_cooldown_hours") or 72)
     approval_mode = settings.get("approval_mode", "manual")
+
+    # ── Stop switches, checked before a single Meta call ──────────────────
+    stopped = guards.killed() or guards.project_paused(settings)
+    if stopped:
+        logger.warning(f"[daily] {project_id} halted before any action: {stopped}")
+        return {"project_id": project_id, "skipped_reason": stopped}
+
+    # What counts as a result on this account. Everything downstream keys off it:
+    # which Meta action families are summed, whether ROAS exists at all, and
+    # which half of the decision prompt the model is shown. See conversions.py.
+    goal = project.get("goal") or "lead"
+
+    # ⚠️ Meta puts an ad set back into its learning phase on a budget edit, and a
+    # jump beyond about 20 percent costs more in lost delivery than the budget
+    # buys. The setting is clamped rather than trusted, because a customer typing
+    # 200 into a box should not be able to reset their own campaign.
+    scale_pct = min(float(settings.get("scale_pct") or 20.0), MAX_SCALE_PCT)
 
     # page_id is REQUIRED to create ad creatives for replacement ads.
     meta = MetaClient(token, account, page_id=project.get("facebook_page_id"))
@@ -526,13 +637,18 @@ def run_full_daily(project_id: str) -> dict:
 
     # ── Step 2: Fetch ad-level insights ──────────────────────
     try:
-        ads = meta.get_insights("ad", window_days)
-        adsets = meta.get_insights("adset", window_days)
-        campaigns = meta.get_insights("campaign", window_days)
+        ads = meta.get_insights("ad", window_days, goal=goal)
+        adsets = meta.get_insights("adset", window_days, goal=goal)
+        campaigns = meta.get_insights("campaign", window_days, goal=goal)
     except Exception as e:
         logger.error(f"[daily] Meta insights failed: {e}")
         summary["errors"].append(f"Meta insights: {e}")
         return summary
+
+    # Written BEFORE the decision step and before the early return below, so the
+    # customer's dashboard fills in on a day when the model decides nothing needs
+    # doing. Reporting is not a side effect of taking an action.
+    summary["snapshot_rows"] = write_daily_snapshot(project_id, ads, adsets, campaigns)
 
     if not ads and not adsets:
         summary["skipped_reason"] = "No active ads or ad sets"
@@ -542,14 +658,56 @@ def run_full_daily(project_id: str) -> dict:
     # to the campaign when the campaign uses CBO (ad set has no own budget).
     adset_to_campaign = {a.get("id"): a.get("campaign_id") for a in (adsets or []) if a.get("id")}
 
+    # Every entity by id, so a guard can look up the results count behind a
+    # proposed budget change without a second Meta call.
+    entity_by_id = {
+        e["id"]: e
+        for e in list(adsets or []) + list(campaigns or []) + list(ads or [])
+        if e.get("id")
+    }
+
+    # The account's committed daily spend, for the portfolio ceiling. Read once
+    # per run: on the Dev tier the app has 600 ads_insights calls per hour per
+    # account, so a per-entity budget read inside the action loop would burn the
+    # quota the next morning's run needs.
+    account_budgets: list[dict] = []
+    for e in list(adsets or []) + list(campaigns or []):
+        try:
+            account_budgets.append({"id": e["id"], "daily_budget": meta.get_entity_budget(e["id"])})
+        except Exception as exc:
+            logger.warning(f"[daily] Could not read budget for {e.get('id')}: {exc}")
+
     # ── Step 3: Claude analysis ───────────────────────────────
+    # ⚠️ `roas` and `cost_per_result` stay null when they do not exist. Rounding
+    # them through `or 0` (which this did) hands the model a measured-looking
+    # zero for every ad on a lead-gen account, and a zero ROAS reads as "this ad
+    # earned nothing" rather than "this account has no ROAS".
+    def _r(v, nd=2):
+        return None if v is None else round(float(v), nd)
+
+    # The account average is what a lead-gen judgement is made against, since
+    # there is no absolute ROAS number to compare to. Computed from spend and
+    # results across every ad rather than by averaging per-ad rates, so one ad
+    # with a single cheap result cannot drag the benchmark down.
+    total_spend = sum(float(a.get("spend") or 0) for a in (ads or []))
+    total_results = sum(float(a.get("results") or 0) for a in (ads or []))
+    account_cost_per_result = (total_spend / total_results) if total_results > 0 else None
+
     snapshot = {
+        "goal": goal,
         "thresholds": {
             "scale_roas_min": scale_roas_min,
             "scale_pct": scale_pct,
             "kill_roas_max": kill_roas_max,
             "kill_spend_min": kill_spend_min,
             "max_daily_budget_usd": max_daily_budget,
+            "max_account_daily_usd": max_account_daily,
+            "min_conversions_to_scale": min_conversions_to_scale,
+        },
+        "account": {
+            "spend": _r(total_spend),
+            "results": _r(total_results),
+            "cost_per_result": _r(account_cost_per_result),
         },
         "window_days": window_days,
         "ads": [
@@ -557,9 +715,11 @@ def run_full_daily(project_id: str) -> dict:
                 "ad_id": a.get("id"),
                 "ad_name": a.get("name"),
                 "adset_id": a.get("adset_id"),
-                "roas": round(float(a.get("roas") or 0), 2),
-                "ctr": round(float(a.get("ctr") or 0), 2),
-                "spend": round(float(a.get("spend") or 0), 2),
+                "roas": _r(a.get("roas")),
+                "results": _r(a.get("results")),
+                "cost_per_result": _r(a.get("cost_per_result")),
+                "ctr": _r(a.get("ctr")),
+                "spend": _r(a.get("spend")),
                 "status": a.get("status"),
             }
             for a in (ads or [])
@@ -570,10 +730,11 @@ def run_full_daily(project_id: str) -> dict:
                 "entity_name": a.get("name"),
                 "entity_level": "adset",
                 "campaign_id": a.get("campaign_id"),
-                "roas": round(float(a.get("roas") or 0), 2),
-                "cpa": round(float(a.get("cpa") or 0), 2),
-                "spend": round(float(a.get("spend") or 0), 2),
-                "frequency": round(float(a.get("frequency") or 0), 2),
+                "roas": _r(a.get("roas")),
+                "results": _r(a.get("results")),
+                "cost_per_result": _r(a.get("cost_per_result")),
+                "spend": _r(a.get("spend")),
+                "frequency": _r(a.get("frequency")),
                 "status": a.get("status"),
             }
             for a in (adsets or [])
@@ -583,9 +744,10 @@ def run_full_daily(project_id: str) -> dict:
                 "entity_id": c.get("id"),
                 "entity_name": c.get("name"),
                 "entity_level": "campaign",
-                "roas": round(float(c.get("roas") or 0), 2),
-                "cpa": round(float(c.get("cpa") or 0), 2),
-                "spend": round(float(c.get("spend") or 0), 2),
+                "roas": _r(c.get("roas")),
+                "results": _r(c.get("results")),
+                "cost_per_result": _r(c.get("cost_per_result")),
+                "spend": _r(c.get("spend")),
                 "status": c.get("status"),
             }
             for c in (campaigns or [])
@@ -601,7 +763,7 @@ def run_full_daily(project_id: str) -> dict:
         msg = client.messages.create(
             model=MODEL,
             max_tokens=1500,
-            system=DAILY_SYSTEM_PROMPT,
+            system=_daily_system_prompt(goal, settings),
             messages=[{"role": "user", "content": json.dumps(snapshot, indent=2)}],
         )
         raw = (msg.content[0].text if msg.content else "{}").strip()
@@ -713,10 +875,32 @@ def run_full_daily(project_id: str) -> dict:
                 meta, entity_id, entity_name, reasoning, adset_to_campaign
             )
 
+        # ── Guards, before anything is queued OR executed ─────────────────
+        # Deliberately ahead of the approval branch. A blocked action must not
+        # reach the customer's queue: asking someone to approve a budget rise
+        # the engine will then refuse teaches them the buttons do nothing.
+        if action_type == "scale_budget":
+            entity_row = entity_by_id.get(entity_id) or {}
+            block = guards.learning_phase_block(entity_row, min_conversions_to_scale)
+            if not block:
+                block = guards.cooldown_block(
+                    project_id, entity_id, "increase", scale_cooldown_hours
+                )
+            if block:
+                logger.info(f"[daily] Skipping scale on {entity_name}: {block}")
+                _save_action(
+                    project_id, user_id, action_type, entity_id, entity_name,
+                    entity_level, "budget", None, None,
+                    f"{reasoning} Not done: {block}", "rejected",
+                )
+                continue
+
         if approval_mode == "auto":
             _execute_budget_action(meta, entity_id, entity_name, entity_level,
                                    action_type, pct, project_id, user_id, reasoning, summary,
-                                   max_daily_budget=max_daily_budget)
+                                   max_daily_budget=max_daily_budget,
+                                   max_account_daily=max_account_daily,
+                                   account_budgets=account_budgets)
         else:
             # Queue for user approval
             _save_action(
@@ -739,7 +923,7 @@ def run_full_daily(project_id: str) -> dict:
         if approval_mode == "auto":
             _create_notification(
                 user_id, project_id, "success",
-                f"Autopilot optimized your campaigns ✅",
+                "We updated your ads",
                 (
                     f"Paused {summary['ads_paused']} underperformers, "
                     f"launched {summary['ads_created']} new creatives, "
@@ -753,7 +937,7 @@ def run_full_daily(project_id: str) -> dict:
                 user_id, project_id, "action",
                 f"{queued} autopilot action{'s' if queued != 1 else ''} need your approval",
                 (
-                    f"Adstra recommends pausing {summary['ads_pause_queued']} ad(s) and "
+                    f"We think you should switch off {summary['ads_pause_queued']} ad(s) and "
                     f"{summary['budget_actions_queued']} budget change(s). "
                     f"Approve them in Autopilot to apply (replacements are created on approval)."
                 ),
@@ -842,24 +1026,46 @@ def _upload_and_create_ad(
             cta_type="SHOP_NOW",
         )
 
-        ad_name = f"Autopilot — Replacement {timestamp_label}"
-        # Start the replacement ACTIVE — the ad set is already live, so a PAUSED
-        # replacement would never serve (defeating the point of replacing a loser).
-        ad_id = meta.create_ad(name=ad_name, adset_id=adset_id, creative_id=creative_id, status="ACTIVE")
+        ad_name = f"Replacement {timestamp_label}"
+        # ⚠️ The replacement is created PAUSED and queued for the customer.
+        #
+        # It used to be created ACTIVE, on the reasoning that a paused
+        # replacement never serves. That is true, and it is also the single
+        # place where the engine spent real money on a creative no human had
+        # ever seen: an AI-generated image went live in a running ad set the
+        # moment a loser was paused. The customer now sees the image and
+        # approves it, which is the same rule every other money-moving action
+        # follows. Approving flips it to ACTIVE (see autopilot_engine).
+        ad_id = meta.create_ad(name=ad_name, adset_id=adset_id, creative_id=creative_id, status="PAUSED")
 
         summary["ads_created"] += 1
         _save_action(
-            project_id, user_id, "create_ad", ad_id, ad_name, "ad",
+            project_id, user_id, "activate_ad", ad_id, ad_name, "ad",
             "replacement", None, None,
-            f"Autopilot replacement for paused ad '{original_ad_name}'",
-            "executed",
-            executed_at=datetime.now(timezone.utc).isoformat(),
+            (
+                f"I made a new ad to replace '{original_ad_name}', which was not "
+                f"working. It is switched off until you approve it. Have a look at "
+                f"the image and the wording, then turn it on if you are happy."
+            ),
+            "pending",
         )
-        logger.info(f"[daily] New ad created: {ad_id} in adset {adset_id}")
+        logger.info(f"[daily] Replacement ad {ad_id} created PAUSED in adset {adset_id}, awaiting approval")
 
     except Exception as e:
-        logger.warning(f"[daily] Ad creation failed (non-fatal): {e}")
+        # ⚠️ Not silent. A replacement that was never created leaves the ad set
+        # one ad lighter with nothing anywhere saying so, which reads as a
+        # working autopilot quietly doing nothing.
+        logger.error(f"[daily] Replacement ad creation FAILED for adset {adset_id}: {e}")
         summary["errors"].append(f"Create ad: {e}")
+        _create_notification(
+            user_id, project_id, "warning",
+            "A replacement ad could not be created",
+            (
+                f"We paused an ad that was not working and tried to put a new one "
+                f"in its place, but the new ad could not be created. Nothing is "
+                f"broken and no money was spent on it. Reason: {e}"
+            ),
+        )
 
 
 def _resolve_budget_target(
@@ -924,8 +1130,10 @@ def _execute_budget_action(
     reasoning: str,
     summary: dict,
     max_daily_budget: Optional[float] = None,
+    max_account_daily: Optional[float] = None,
+    account_budgets: Optional[list[dict]] = None,
 ) -> None:
-    """Execute a budget action immediately (auto mode), enforcing the spend ceiling."""
+    """Execute a budget action immediately (auto mode), enforcing the spend ceilings."""
     value_before = None
     value_after = None
     exec_status = "executed"
@@ -942,24 +1150,62 @@ def _execute_budget_action(
                     "Ad set has no own daily budget (campaign uses CBO) — "
                     "budget must be changed at the campaign level"
                 )
+            direction = "increase" if action_type == "scale_budget" else "decrease"
+
             if action_type == "scale_budget":
-                new = current * (1 + pct / 100)
-                # Never exceed the configured spend ceiling.
+                # ⚠️ pct is clamped by the caller to MAX_SCALE_PCT, but clamp
+                # again here: this function is also reachable from the approval
+                # path, where the percentage arrives from a stored row.
+                new = current * (1 + min(pct, MAX_SCALE_PCT) / 100)
+                # Never exceed the configured per-entity ceiling.
                 if max_daily_budget and new > max_daily_budget:
                     logger.info(
                         f"[daily] Capping scale on {entity_name}: "
                         f"{new:.2f} → max {max_daily_budget:.2f}"
                     )
                     new = max_daily_budget
+
+                # Then the ceiling that the customer actually meant: the whole
+                # account, not this one entity.
+                if account_budgets is not None and max_account_daily:
+                    blocked = guards.account_cap_block(
+                        account_budgets, entity_id, current, new, max_account_daily
+                    )
+                    if blocked:
+                        raise guards.Blocked(blocked)
             else:
                 new = current * (1 - pct / 100)
-            written = meta.set_budget(entity_id, new)
+
+            if DRY_RUN:
+                logger.info(
+                    f"[daily] DRY RUN would {action_type} {entity_name} "
+                    f"({entity_id}): {current:.2f} -> {new:.2f}"
+                )
+                written = new
+            else:
+                written = meta.set_budget(entity_id, new)
+                guards.record_budget_change(project_id, entity_id, entity_level, direction)
+
             value_before, value_after = round(current, 2), round(written, 2)
         elif action_type == "pause":
-            meta.pause(entity_id)
+            if DRY_RUN:
+                logger.info(f"[daily] DRY RUN would pause {entity_name} ({entity_id})")
+            else:
+                meta.pause(entity_id)
 
         summary["budget_actions_taken"] += 1
         logger.info(f"[daily] {action_type} on {entity_name}: {value_before} → {value_after}")
+    except guards.Blocked as e:
+        # A guard refusing is a normal outcome, not a failure. Recorded as
+        # 'rejected' so it shows in the history as a decision that was
+        # deliberately not taken, with the reason the customer can read.
+        logger.info(f"[daily] Budget action {action_type} on {entity_name} blocked: {e}")
+        _save_action(
+            project_id, user_id, action_type, entity_id, entity_name,
+            entity_level, "budget", None, None, f"{reasoning} Not done: {e}",
+            "rejected",
+        )
+        return
     except Exception as e:
         exec_status = "failed"
         error_detail = str(e)

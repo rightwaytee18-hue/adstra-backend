@@ -1,5 +1,9 @@
 [build]
 builder = "nixpacks"
+# ⚠️ Python 3.11 is pinned in .python-version and nixpacks reads it. It is not
+# cosmetic: google-genai requires >= 3.10, so a nixpacks default of 3.9 fails
+# the pip resolve and takes the whole service down. That is the exact failure
+# mode that kept this repo undeployed from May to August 2026.
 # pip install is required and fatal. The chromium install is best-effort: it is
 # only used by the competitor scraper (scraper.py imports playwright lazily and
 # raises a caught error if the browser is absent), so a failed browser install

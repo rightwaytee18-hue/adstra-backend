@@ -43,7 +43,11 @@ app = FastAPI(title="Adstra Backend", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://app.adstra.live", "http://localhost:3001"],
+    # The Adstra customer app is retired. The only browser origin that talks to
+    # this service now is the Reveal portal, and every portal call is proxied
+    # through a Reveal server route carrying x-api-secret, so no browser hits
+    # this directly at all. Kept narrow rather than opened up.
+    allow_origins=["https://revealai.live", "http://localhost:3000"],
     allow_methods=["GET", "POST", "PATCH", "DELETE"],
     allow_headers=["*"],
 )

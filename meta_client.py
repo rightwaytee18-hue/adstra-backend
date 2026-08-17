@@ -8,9 +8,29 @@ from typing import Optional
 
 import requests
 
+from conversions import derive
+
 logger = logging.getLogger(__name__)
 
-API_VERSION = "v22.0"
+# Marketing API version. This is the ONLY place a version is written; anything
+# that needs one imports it from here.
+#
+# ⚠️ Marketing API versions expire, and an expired one stops serving ad
+# endpoints. This client sat on v22.0, which expired 2026-02-19, for roughly six
+# months. The published schedule, so the next drift is visible rather than
+# discovered in production:
+#
+#   v21.0  expired 2025-09-09
+#   v22.0  expired 2026-02-19
+#   v23.0  expired 2026-06-09
+#   v24.0  expires 2026-10-06
+#   v25.0  current
+#
+# Re-check before v25.0 ages out. Bumping is usually a one-line change, but read
+# the changelog first: v25.0 removed the ability to create or update
+# Advantage+ Shopping and Advantage+ App campaigns through the API entirely.
+API_VERSION = "v25.0"
+API_VERSION_EXPIRES = "unannounced as of 2026-08-15"
 BASE = f"https://graph.facebook.com/{API_VERSION}"
 
 # Meta Graph API error codes that signal throttling / transient failure and are
@@ -138,7 +158,14 @@ class MetaClient:
     # READ helpers (rules engine)                                         #
     # ------------------------------------------------------------------ #
 
-    def get_insights(self, level: str, window_days: int) -> list[dict]:
+    def get_insights(self, level: str, window_days: int, goal: str = "lead") -> list[dict]:
+        """
+        Insights for every entity at `level`, with results counted for `goal`.
+
+        `goal` defaults to 'lead' rather than 'purchase' because the safe failure
+        is under-reporting revenue on an ecommerce account, not reporting zero
+        results forever on a service business. See conversions.py.
+        """
         now = datetime.utcnow()
         since = (now - timedelta(days=window_days)).strftime("%Y-%m-%d")
         until = now.strftime("%Y-%m-%d")
@@ -200,17 +227,11 @@ class MetaClient:
             cpm = float(ins.get("cpm", 0))
             frequency = float(ins.get("frequency", 0))
 
-            purchases = 0
-            revenue = 0.0
-            for a in ins.get("actions", []):
-                if a.get("action_type") == "purchase":
-                    purchases = int(float(a.get("value", 0)))
-            for a in ins.get("action_values", []):
-                if a.get("action_type") == "purchase":
-                    revenue = float(a.get("value", 0))
-
-            roas = revenue / spend if spend > 0 else 0.0
-            cpa = spend / purchases if purchases > 0 else 0.0
+            # Counted per goal, and de-duplicated within each action family.
+            # Previously this read the single action type "purchase", which is
+            # always absent on a lead-gen account, so every service business
+            # measured 0 results and 0.0 ROAS. See conversions.py.
+            derived = derive(ins, goal)
 
             results.append({
                 "id": item["id"],
@@ -219,12 +240,21 @@ class MetaClient:
                 "adset_id": item.get("adset_id"),
                 "campaign_id": item.get("campaign_id"),
                 "spend": spend,
-                "roas": roas,
-                "cpa": cpa,
+                # None for any non-purchase goal. Callers MUST skip a None
+                # rather than compare it; treating it as 0.0 is what made the
+                # kill rule match every lead-gen ad.
+                "roas": derived["roas"],
+                "cpa": derived["cpa"],
+                "cost_per_result": derived["cost_per_result"],
+                "results": derived["results"],
+                "revenue": derived["revenue"],
+                "goal": goal,
                 "cpm": cpm,
                 "ctr": ctr,
                 "frequency": frequency,
-                "purchases": purchases,
+                # Kept so anything still reading `purchases` keeps working. On a
+                # lead goal this is the count of enquiries, not orders.
+                "purchases": int(derived["results"]),
             })
 
         return results

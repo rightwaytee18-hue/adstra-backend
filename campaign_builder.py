@@ -9,6 +9,7 @@ so they work regardless of the user's JWT state.
 
 import logging
 from typing import Optional
+from crypto import token_for
 from db import get_db
 from meta_client import MetaClient, MetaAPIError
 
@@ -40,7 +41,7 @@ def _load_project(project_id: str) -> dict:
 def preflight_for_project(project_id: str, draft: dict) -> dict:
     """Run validation reads only. Returns {ok, steps[]}."""
     project = _load_project(project_id)
-    token = project.get("meta_access_token")
+    token = token_for(project)
     account = project.get("ad_account_id")
     page_id = project.get("facebook_page_id")
     pixel_id = project.get("pixel_id")
@@ -48,7 +49,7 @@ def preflight_for_project(project_id: str, draft: dict) -> dict:
     if not token or not account:
         return {
             "ok": False,
-            "steps": [{"step": "token", "ok": False, "detail": "Meta not connected — reconnect via Settings."}],
+            "steps": [{"step": "token", "ok": False, "detail": "Your Facebook account is not connected yet."}],
         }
 
     template_key = draft.get("template_key", "sales")
@@ -75,7 +76,7 @@ def publish_for_project(project_id: str, draft: dict) -> dict:
     }
     """
     project = _load_project(project_id)
-    token = project.get("meta_access_token")
+    token = token_for(project)
     account = project.get("ad_account_id")
     page_id = project.get("facebook_page_id")
     pixel_id = project.get("pixel_id")
@@ -87,7 +88,7 @@ def publish_for_project(project_id: str, draft: dict) -> dict:
     template_key = draft.get("template_key", "sales")
     objective, optimization_goal = TEMPLATE_MAP.get(template_key, TEMPLATE_MAP["sales"])
 
-    campaign_name = draft.get("name") or f"Adstra — {template_key.capitalize()} Campaign"
+    campaign_name = draft.get("name") or f"Reveal - {template_key.capitalize()} Campaign"
     budget_mode = draft.get("budget_mode", "cbo")
     daily_budget_cents = draft.get("daily_budget_cents")
     bid_strategy = draft.get("bid_strategy", "LOWEST_COST_WITHOUT_CAP")
@@ -157,7 +158,7 @@ def publish_for_project(project_id: str, draft: dict) -> dict:
 
         adset_id = client.create_adset(
             campaign_id=campaign_id,
-            name=f"{campaign_name} — Ad Set 1",
+            name=f"{campaign_name} - Ad Set 1",
             optimization_goal=optimization_goal,
             targeting=targeting,
             attribution_spec=DEFAULT_ATTRIBUTION,
@@ -196,7 +197,7 @@ def publish_for_project(project_id: str, draft: dict) -> dict:
         # Create ad creative
         try:
             creative_id = client.create_ad_creative(
-                name=f"Creative {ad_num} — {headline[:40]}",
+                name=f"Creative {ad_num} - {headline[:40]}",
                 image_hash=image_hash,
                 link=destination,
                 message=message,
@@ -215,7 +216,7 @@ def publish_for_project(project_id: str, draft: dict) -> dict:
         # Create ad
         try:
             ad_id = client.create_ad(
-                name=f"{campaign_name} — Ad {ad_num}",
+                name=f"{campaign_name} - Ad {ad_num}",
                 adset_id=adset_id,
                 creative_id=creative_id,
             )

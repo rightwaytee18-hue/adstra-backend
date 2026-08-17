@@ -18,6 +18,7 @@ from typing import Optional
 
 import anthropic
 
+from crypto import token_for
 from db import get_db
 from meta_client import MetaClient, MetaAPIError
 
@@ -126,7 +127,7 @@ def briefing_for_project(project_id: str) -> dict:
         return {"ok": False, "error": str(e)}
 
     user_id = project.get("user_id", "")
-    token = project.get("meta_access_token")
+    token = token_for(project)
     account = project.get("ad_account_id")
 
     if not token or not account or not project.get("meta_connected"):
@@ -183,7 +184,7 @@ def briefing_for_project(project_id: str) -> dict:
     _create_notification(
         user_id, project_id, "info",
         f"Your weekly briefing is ready ({period_label})",
-        "Adstra AI analyzed your performance and has strategic recommendations waiting.",
+        "We looked over how your ads did this week and have some suggestions waiting for you.",
         "/autopilot",
     )
 
@@ -275,7 +276,7 @@ def execute_approved_action(action_id: str, project_id: str) -> dict:
         project = _load_project(project_id)
         settings = _load_settings(project_id) or {}
 
-        token = project.get("meta_access_token")
+        token = token_for(project)
         account = project.get("ad_account_id")
         if not token or not account or not project.get("meta_connected"):
             raise MetaAPIError("Meta not connected for this project")

@@ -13,7 +13,8 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
-FROM_EMAIL = "Adstra <hello@adstra.live>"
+# support@, never a personal address, and never the retired adstra.live domain.
+FROM_EMAIL = "Reveal <support@revealai.live>"
 BASE_URL = "https://api.resend.com"
 
 
@@ -50,7 +51,7 @@ def _html_wrapper(content: str, preheader: str = "") -> str:
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Adstra</title>
+  <title>Reveal</title>
 </head>
 <body style="margin:0;padding:0;background:#04040a;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;">
   {"<span style='display:none;max-height:0;overflow:hidden;'>" + preheader + "</span>" if preheader else ""}
@@ -75,8 +76,8 @@ def _html_wrapper(content: str, preheader: str = "") -> str:
           <tr>
             <td style="padding:20px 32px;border-top:1px solid rgba(255,255,255,0.05);">
               <p style="margin:0;font-size:11px;color:rgba(255,255,255,0.2);line-height:1.6;">
-                You're receiving this because you have an Adstra account.
-                Manage notification preferences in <a href="https://app.adstra.live/settings"
+                You are receiving this because you have a Reveal account.
+                Manage notification preferences in <a href="https://revealai.live/app"
                   style="color:#00c2ff;text-decoration:none;">Settings</a>.
               </p>
             </td>
@@ -120,50 +121,50 @@ def send_welcome(to: str, first_name: str) -> dict:
     """Welcome email sent after first successful onboarding."""
     name = first_name or "there"
     content = (
-        h2(f"Welcome to Adstra, {name} 👋") +
+        h2(f"Welcome, {name}") +
         p("Your account is live. Here's what to do first:") +
         p("""
-          <strong style="color:rgba(255,255,255,0.85);">1. Connect your Meta account</strong> — link your Ad Account and Facebook Page so Adstra can read your data and publish campaigns.<br><br>
-          <strong style="color:rgba(255,255,255,0.85);">2. Set your goals</strong> — tell us your target ROAS or CPA so the rules engine knows what "winning" looks like.<br><br>
+          <strong style="color:rgba(255,255,255,0.85);">1. Connect your Facebook account</strong> so we can build and run your ads for you.<br><br>
+          <strong style="color:rgba(255,255,255,0.85);">2. Tell us your budget</strong> so we know how much a day you are comfortable spending.<br><br>
           <strong style="color:rgba(255,255,255,0.85);">3. Build your first campaign</strong> — the Campaign Builder takes under 5 minutes.
         """) +
-        cta_button("Go to Dashboard →", "https://app.adstra.live/dashboard")
+        cta_button("Go to Dashboard →", "https://revealai.live/app")
     )
-    return _send(to, "Welcome to Adstra — let's get your ads optimized", _html_wrapper(content, "Your AI-powered Meta ads platform is ready."))
+    return _send(to, "Welcome to Reveal", _html_wrapper(content, "Your ads are ready to set up."))
 
 
 def send_autopilot_summary(to: str, project_name: str, actions_taken: int, actions_queued: int) -> dict:
     """Daily autopilot summary."""
     total = actions_taken + actions_queued
-    subject = f"Adstra autopilot: {total} action{'s' if total != 1 else ''} for {project_name}"
+    subject = f"{total} thing{'s' if total != 1 else ''} to look at for {project_name}"
 
     if actions_taken > 0 and actions_queued == 0:
-        headline = f"Autopilot optimized {actions_taken} campaign element{'s' if actions_taken != 1 else ''} ✅"
-        desc = f"Adstra automatically applied {actions_taken} optimization{'s' if actions_taken != 1 else ''} to your {project_name} account."
+        headline = f"We made {actions_taken} change{'s' if actions_taken != 1 else ''} to your ads"
+        desc = f"We made {actions_taken} change{'s' if actions_taken != 1 else ''} to your {project_name} ads."
     elif actions_queued > 0:
         headline = f"{actions_queued} action{'s' if actions_queued != 1 else ''} waiting for your approval"
-        desc = f"Adstra identified {actions_queued} optimization opportunit{'ies' if actions_queued != 1 else 'y'} for {project_name}. Review and approve below."
+        desc = f"We found {actions_queued} thing{'s' if actions_queued != 1 else ''} worth changing on your {project_name} ads. Have a look and approve what you are happy with."
     else:
         headline = "Autopilot ran — no actions needed today"
-        desc = f"Your {project_name} campaigns look healthy. Adstra found no scaling or budget changes to make today."
+        desc = f"Your {project_name} ads are doing fine. Nothing needed changing today."
 
     content = (
         h2(headline) +
         p(desc) +
-        cta_button("Review in Autopilot →", "https://app.adstra.live/autopilot")
+        cta_button("Review in Autopilot →", "https://revealai.live/app/ads")
     )
     return _send(to, subject, _html_wrapper(content, desc[:80]))
 
 
 def send_weekly_briefing(to: str, project_name: str, period_label: str, briefing_preview: str) -> dict:
     """Weekly briefing notification email."""
-    subject = f"Your Adstra weekly briefing ({period_label})"
+    subject = f"Your weekly ad summary ({period_label})"
     preview = (briefing_preview[:200] + "…") if len(briefing_preview) > 200 else briefing_preview
     content = (
         h2(f"Weekly Performance Briefing — {period_label}") +
-        p(f"Your Adstra AI has reviewed your <strong>{project_name}</strong> account and has strategic recommendations ready.") +
+        p(f"We looked over your <strong>{project_name}</strong> ads this week. Here is what stood out.") +
         p(preview, muted=True) +
-        cta_button("Read Full Briefing →", "https://app.adstra.live/autopilot")
+        cta_button("Read Full Briefing →", "https://revealai.live/app/ads")
     )
     return _send(to, subject, _html_wrapper(content, f"Your weekly ads briefing for {period_label} is ready."))
 
@@ -171,7 +172,7 @@ def send_weekly_briefing(to: str, project_name: str, period_label: str, briefing
 def send_campaign_published(to: str, campaign_name: str, campaign_id: str) -> dict:
     """Sent when a campaign is successfully published."""
     content = (
-        h2("Campaign published ✅") +
+        h2("Your ads are live") +
         p(f"<strong style='color:rgba(255,255,255,0.85);'>{campaign_name}</strong> has been created in your Meta Ads Manager. It starts <strong>paused</strong> — nothing spends until you turn it on.") +
         p(f"Campaign ID: <code style='font-family:monospace;color:#00c2ff;'>{campaign_id}</code>", muted=True) +
         cta_button("Open in Meta Ads Manager →", f"https://www.facebook.com/adsmanager/manage/campaigns")

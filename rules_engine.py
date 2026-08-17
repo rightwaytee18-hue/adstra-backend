@@ -6,6 +6,8 @@ import logging
 from datetime import datetime, timezone
 from typing import Any
 
+import guards
+from crypto import token_for
 from db import get_db
 from meta_client import MetaClient
 
@@ -43,11 +45,14 @@ def run_for_project(project_id: str) -> list[dict]:
 
     # Load project (need meta token + account id)
     proj_resp = db.table("projects").select(
-        "id,meta_access_token,ad_account_id,meta_connected,target_roas,target_cpa,daily_budget_cap"
+        "id,meta_access_token,meta_access_token_enc,ad_account_id,meta_connected,"
+        "target_roas,target_cpa,"
+        "daily_budget_cap,goal"
     ).eq("id", project_id).maybe_single().execute()
 
     project = proj_resp.data if proj_resp else None
-    if not project or not project.get("meta_connected") or not project.get("meta_access_token"):
+    token = token_for(project) if project else None
+    if not project or not project.get("meta_connected") or not token:
         logger.info(f"Project {project_id} not Meta-connected, skipping.")
         return []
 
@@ -57,7 +62,28 @@ def run_for_project(project_id: str) -> list[dict]:
     if not rules:
         return []
 
-    meta = MetaClient(project["meta_access_token"], project["ad_account_id"])
+    # Same settings row the autopilot reads, so both engines obey one answer to
+    # "does this customer want to be asked first".
+    settings_resp = (
+        db.table("autopilot_settings")
+        .select("approval_mode, paused_at")
+        .eq("project_id", project_id)
+        .maybe_single()
+        .execute()
+    )
+    settings = (settings_resp.data if settings_resp else None) or {}
+    approval_mode = settings.get("approval_mode") or "manual"
+
+    # Stop switches apply here too. This engine runs every six hours, four times
+    # more often than the autopilot, so a kill switch it did not honour would be
+    # the first thing to keep spending after someone pulled the handle.
+    stopped = guards.killed() or guards.project_paused(settings)
+    if stopped:
+        logger.warning(f"[rules] {project_id} halted: {stopped}")
+        return []
+
+    meta = MetaClient(token, project["ad_account_id"])
+    goal = project.get("goal") or "lead"
     actions_taken = []
 
     # Group rules by (level, window_days) to minimize Meta API calls
@@ -68,7 +94,7 @@ def run_for_project(project_id: str) -> list[dict]:
         key = (level, window_days)
         if key not in cache:
             try:
-                cache[key] = meta.get_insights(level, window_days)
+                cache[key] = meta.get_insights(level, window_days, goal=goal)
             except Exception as e:
                 logger.error(f"Meta insights fetch failed for {level}/{window_days}d: {e}")
                 cache[key] = []
@@ -99,8 +125,18 @@ def run_for_project(project_id: str) -> list[dict]:
                     all_met = False
                     break
 
-                entity_value = entity.get(metric, 0.0) or 0.0
-                if not _meets_condition(entity_value, op, threshold):
+                # ⚠️ An ABSENT metric is not a zero one. This line used to read
+                # `entity.get(metric, 0.0) or 0.0`, which turned "this account
+                # has no ROAS because it sells no products" into "this ad earned
+                # nothing", so a rule like `roas less_than 0.5` matched every ad
+                # on every lead-gen account and the engine paused all of them.
+                # A metric we cannot measure fails the condition instead.
+                entity_value = entity.get(metric)
+                if entity_value is None:
+                    all_met = False
+                    break
+
+                if not _meets_condition(float(entity_value), op, threshold):
                     all_met = False
                     break
 
@@ -122,6 +158,25 @@ def run_for_project(project_id: str) -> list[dict]:
                     logger.info(f"Skipping {entity['id']} — budget changed {hours_since:.1f}h ago")
                     continue
 
+            # ⚠️ Money-moving rule actions go to the SAME approval queue the
+            # autopilot uses. This engine used to execute pauses and budget
+            # changes outright, every six hours, with no approval step of any
+            # kind, while the autopilot beside it queued the identical action for
+            # the customer. So the customer-approves promise held for one code
+            # path and not the other, and the faster one won.
+            #
+            # send_alert is exempt: it moves no money and queueing a notification
+            # behind an approval is just a notification nobody sees.
+            if action in ("pause", "scale_budget", "reduce_budget") and approval_mode != "auto":
+                _queue_action(db, project_id, project.get("user_id"), rule, entity, action, action_value)
+                actions_taken.append({
+                    "rule": rule["name"],
+                    "action": action,
+                    "target": entity.get("name"),
+                    "status": "pending",
+                })
+                continue
+
             # Execute action
             result = _execute_action(meta, db, project_id, rule, entity, action, action_value)
             if result:
@@ -133,6 +188,53 @@ def run_for_project(project_id: str) -> list[dict]:
                 }).eq("id", rule["id"]).execute()
 
     return actions_taken
+
+
+def _queue_action(
+    db: Any,
+    project_id: str,
+    user_id: str | None,
+    rule: dict,
+    entity: dict,
+    action: str,
+    action_value: float | None,
+) -> None:
+    """
+    Write a rule's proposed action to the shared approval queue.
+
+    Same table and same shape as the autopilot's own queued actions, so the
+    portal renders both through one path and the customer never learns that two
+    different engines exist inside their ad manager.
+
+    The reasoning is written in plain language for the same reason: it is shown
+    verbatim on the decision card the customer taps.
+    """
+    name = entity.get("name") or "this ad"
+    spend = float(entity.get("spend") or 0)
+
+    if action == "pause":
+        why = f"\"{name}\" has spent ${spend:,.0f} and is not performing, so I want to switch it off."
+    elif action == "scale_budget":
+        why = f"\"{name}\" is doing well, so I want to put a bit more behind it."
+    else:
+        why = f"\"{name}\" is costing more than it is bringing in, so I want to spend less on it."
+
+    try:
+        db.table("autopilot_actions").insert({
+            "project_id": project_id,
+            "user_id": user_id,
+            "action_type": action,
+            "entity_id": entity["id"],
+            "entity_name": name,
+            "entity_level": "adset",
+            "metric": "rule",
+            "value_before": None,
+            "value_after": None,
+            "reasoning": f"{why} (Rule: {rule.get('name')})",
+            "status": "pending",
+        }).execute()
+    except Exception as e:
+        logger.error(f"[rules] Could not queue {action} on {entity.get('id')}: {e}")
 
 
 def _execute_action(
