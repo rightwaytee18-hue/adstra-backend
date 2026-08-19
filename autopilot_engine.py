@@ -18,6 +18,7 @@ from typing import Optional
 
 import anthropic
 
+import guards
 from crypto import token_for
 from db import get_db
 from meta_client import MetaClient, MetaAPIError
@@ -281,6 +282,17 @@ def execute_approved_action(action_id: str, project_id: str) -> dict:
         if not token or not account or not project.get("meta_connected"):
             raise MetaAPIError("Meta not connected for this project")
 
+        # ⚠️ THE STOP SWITCHES APPLY HERE TOO, and did not used to.
+        #
+        # This function is what the customer's Approve button calls, and manual
+        # approval is the RECOMMENDED mode, so it is the path most spend flows
+        # through. It consulted none of the guards: the account-wide kill switch
+        # did not stop an approval, and the per-project pause did not either.
+        # Pulling the handle stopped the autopilot and left the queue live.
+        stopped = guards.killed() or guards.project_paused(settings)
+        if stopped:
+            raise MetaAPIError(stopped)
+
         # Use settings-configured percentages so approval matches what was promised
         scale_pct = float(settings.get("scale_pct") or 20.0)
         reduce_pct = 25.0  # reduce is always 25% (conservative)
@@ -304,16 +316,58 @@ def execute_approved_action(action_id: str, project_id: str) -> dict:
                 new = current * (1 + scale_pct / 100)
                 if new > max_daily_budget:
                     new = max_daily_budget
+
+                # ⚠️ The ACCOUNT ceiling, which this path used to ignore entirely.
+                #
+                # max_daily_budget above is per entity. max_account_daily_usd is
+                # the number the portal's settings card describes to the owner as
+                # "The most to spend in a day, across all your ads" and promises
+                # "We will never go above this, whatever is working". It was
+                # enforced only in auto mode, so in the recommended manual mode a
+                # customer approving three queued increases walked straight past
+                # their own stated ceiling. Read live rather than from a snapshot,
+                # because approvals arrive one at a time, minutes apart.
+                max_account_daily = float(settings.get("max_account_daily_usd") or 1000.0)
+                budgets = []
+                for other in meta.get_insights("adset", 1, goal=project.get("goal") or "lead"):
+                    if other.get("id"):
+                        try:
+                            budgets.append({"id": other["id"], "daily_budget": meta.get_entity_budget(other["id"])})
+                        except Exception:
+                            continue
+                blocked = guards.account_cap_block(budgets, entity_id, current, new, max_account_daily)
+                if blocked:
+                    raise MetaAPIError(blocked)
             else:
                 new = current * (1 - reduce_pct / 100)
             written = meta.set_budget(entity_id, new)
             value_before, value_after = round(current, 2), round(written, 2)
+
+            # ⚠️ Record it, or the cooldown never sees an approved increase and
+            # the same entity can be raised again tomorrow, and the day after.
+            guards.record_budget_change(
+                project_id,
+                entity_id,
+                action.get("entity_level") or "adset",
+                "increase" if action_type == "scale_budget" else "decrease",
+            )
         elif action_type == "pause":
             meta.pause(entity_id)
             # Only ad-level pauses get a replacement ad — mirrors auto mode, where
             # adset/campaign pauses do not generate replacements.
             if action.get("entity_level") == "ad":
                 extra = _replace_after_pause(meta, project, project_id, action, entity_id)
+        elif action_type in ("activate_ad", "create_ad"):
+            # ⚠️ This branch did not exist, and without it approving a
+            # replacement ad ALWAYS failed.
+            #
+            # Replacement ads are created PAUSED and queued as 'activate_ad' so a
+            # customer sees the image and the wording before it can spend. That
+            # change had no working other end: the customer tapped "Turn it on",
+            # fell through to the unknown-action raise, the row went to 'failed',
+            # and the replacement stayed paused forever while the ad set sat one
+            # ad lighter. Turning it on IS the approval.
+            meta.set_status(entity_id, "ACTIVE")
         elif action_type == "alert":
             pass  # alerts are informational only
         else:

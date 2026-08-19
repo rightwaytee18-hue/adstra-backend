@@ -163,8 +163,14 @@ def derive(insights: dict, goal: str) -> dict:
         "revenue": revenue,
         "roas": roas,
         "cost_per_result": cost_per_result,
-        # Kept under the old key so existing callers and the rules engine's
-        # 'cpa' metric keep working. It is the same number.
-        "cpa": cost_per_result or 0.0,
+        # ⚠️ None, never 0.0. This read `cost_per_result or 0.0`, which undid the
+        # whole absent-is-not-zero fix for the one cost metric a rule can
+        # actually use: `cpa` is in rules_engine.METRIC_KEYS and `results` and
+        # `cost_per_result` are not. An entity that spent real money and produced
+        # NOTHING has no cost per result, but reported 0.0, so the natural rule
+        # "cpa less_than 40 -> scale_budget" (the direct translation of the
+        # customer's target cost per customer) matched every dead ad on the
+        # account and proposed raising its budget.
+        "cpa": cost_per_result,
         "goal": goal,
     }

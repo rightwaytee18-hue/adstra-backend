@@ -252,6 +252,12 @@ class MetaClient:
                 "cpm": cpm,
                 "ctr": ctr,
                 "frequency": frequency,
+                # ⚠️ These were parsed into locals and then dropped on the floor.
+                # snapshots._row reads them by name, so every ad_insights_daily
+                # row recorded 0 impressions and 0 clicks, and the portal showed
+                # zeroes for both forever.
+                "impressions": impressions,
+                "clicks": clicks,
                 # Kept so anything still reading `purchases` keeps working. On a
                 # lead goal this is the count of enquiries, not orders.
                 "purchases": int(derived["results"]),

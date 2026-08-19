@@ -42,7 +42,19 @@ def _key() -> bytes:
             "COMMERCE_ENCRYPTION_KEY is not set; cannot decrypt Meta tokens"
         )
     try:
-        key = bytes.fromhex(raw) if _HEX_KEY.match(raw) else base64.b64decode(raw)
+        if _HEX_KEY.match(raw):
+            key = bytes.fromhex(raw)
+        else:
+            # ⚠️ Must accept exactly what Node's Buffer.from(raw, 'base64')
+            # accepts, or the two sides disagree about the KEY and every decrypt
+            # fails. Node tolerates base64url alphabet (- and _) and missing
+            # padding; Python's b64decode raises on missing padding and silently
+            # DISCARDS - and _ rather than translating them, which yields a
+            # different, shorter key from the same string. Translate first, then
+            # pad, so a rotation to a base64url value cannot lock every customer
+            # out of their own ad account.
+            norm = raw.replace("-", "+").replace("_", "/")
+            key = base64.b64decode(norm + "=" * (-len(norm) % 4))
     except (ValueError, binascii.Error) as e:
         raise TokenCryptoError(f"COMMERCE_ENCRYPTION_KEY is not valid hex or base64: {e}")
     if len(key) != 32:

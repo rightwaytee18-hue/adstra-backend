@@ -125,6 +125,12 @@ def cooldown_block(
             .select("changed_at")
             .eq("project_id", project_id)
             .eq("adset_id", entity_id)
+            # ⚠️ Increases only. record_budget_change stamps a direction, and
+            # without this filter a budget DECREASE two hours ago blocked an
+            # increase for 72 hours with the sentence "We raised this budget 2
+            # hours ago", which the customer reads in their history and which
+            # did not happen.
+            .eq("direction", "increase")
             .order("changed_at", desc=True)
             .limit(1)
             .execute()
