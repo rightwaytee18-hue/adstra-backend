@@ -45,9 +45,15 @@ def run_for_project(project_id: str) -> list[dict]:
 
     # Load project (need meta token + account id)
     proj_resp = db.table("projects").select(
-        "id,meta_access_token,meta_access_token_enc,ad_account_id,meta_connected,"
-        "target_roas,target_cpa,"
-        "daily_budget_cap,goal"
+        # ⚠️ user_id is load-bearing and was NOT in this list, so
+        # project.get("user_id") was always None and every queued row landed with
+        # a null owner. RLS on autopilot_actions is `auth.uid() = user_id`, so a
+        # legacy profile-owned project's customer could never see the decision
+        # while the rules engine re-queued it every six hours. Reveal tenants are
+        # unaffected (they have no auth user by design) but the column still has
+        # to be selected to be read.
+        "id,user_id,meta_access_token,meta_access_token_enc,ad_account_id,"
+        "meta_connected,target_roas,target_cpa,daily_budget_cap,goal"
     ).eq("id", project_id).maybe_single().execute()
 
     project = proj_resp.data if proj_resp else None
@@ -168,7 +174,7 @@ def run_for_project(project_id: str) -> list[dict]:
             # send_alert is exempt: it moves no money and queueing a notification
             # behind an approval is just a notification nobody sees.
             if action in ("pause", "scale_budget", "reduce_budget") and approval_mode != "auto":
-                _queue_action(db, project_id, project.get("user_id"), rule, entity, action, action_value)
+                _queue_action(db, meta, project_id, project.get("user_id"), rule, entity, level, action, action_value)
                 actions_taken.append({
                     "rule": rule["name"],
                     "action": action,
@@ -192,10 +198,12 @@ def run_for_project(project_id: str) -> list[dict]:
 
 def _queue_action(
     db: Any,
+    meta: MetaClient,
     project_id: str,
     user_id: str | None,
     rule: dict,
     entity: dict,
+    level: str,
     action: str,
     action_value: float | None,
 ) -> None:
@@ -209,8 +217,62 @@ def _queue_action(
     The reasoning is written in plain language for the same reason: it is shown
     verbatim on the decision card the customer taps.
     """
+    entity_id = entity["id"]
     name = entity.get("name") or "this ad"
     spend = float(entity.get("spend") or 0)
+
+    # ⚠️ DO NOT QUEUE A DUPLICATE.
+    #
+    # This ran every six hours with no check for an existing pending row, and the
+    # 24h budget cooldown above it only sees EXECUTED changes, never queued ones.
+    # Pause had no cooldown at all. So one rule matching one ad produced four
+    # identical decision cards a day until the customer acted, and /api/portal/ads
+    # pulls fifty of them: the "Waiting for you" list became the same sentence
+    # over and over and the page announced "There are 50 things waiting for you
+    # to decide."
+    try:
+        existing = (
+            db.table("autopilot_actions")
+            .select("id")
+            .eq("project_id", project_id)
+            .eq("entity_id", entity_id)
+            .eq("action_type", action)
+            .eq("status", "pending")
+            .limit(1)
+            .execute()
+        )
+        if existing.data:
+            logger.info(f"[rules] {action} on {entity_id} already waiting for approval, not queueing again")
+            return
+    except Exception as e:
+        # Fail CLOSED on the dedupe read. Queueing anyway risks the fifty-card
+        # pile-up this guard exists to prevent, and a missed decision resurfaces
+        # on the next run six hours later.
+        logger.warning(f"[rules] Could not check for an existing pending {action} on {entity_id}: {e}")
+        return
+
+    # ⚠️ The customer is being asked to approve a MONEY change, so the card has to
+    # carry the money. value_before/value_after were both None, so the portal's
+    # describeDecision dropped the "from $40 to $48 a day" clause entirely and the
+    # owner approved "Spend a bit more on Summer promo" with no figure anywhere on
+    # screen. Read the budget now rather than at approval time, because the number
+    # they agree to should be the number they were shown.
+    value_before: float | None = None
+    value_after: float | None = None
+    if action in ("scale_budget", "reduce_budget"):
+        try:
+            current = meta.get_entity_budget(entity_id)
+            if current > 0:
+                pct = float(action_value or (20 if action == "scale_budget" else 25))
+                value_before = round(current, 2)
+                value_after = round(
+                    current * (1 + pct / 100) if action == "scale_budget" else current * (1 - pct / 100),
+                    2,
+                )
+        except Exception as e:
+            # A card with no figure is worse than none, but refusing to queue a
+            # real finding because we could not read a budget is worse still.
+            logger.warning(f"[rules] Could not read budget for {entity_id} while queueing: {e}")
 
     if action == "pause":
         why = f"\"{name}\" has spent ${spend:,.0f} and is not performing, so I want to switch it off."
@@ -224,17 +286,22 @@ def _queue_action(
             "project_id": project_id,
             "user_id": user_id,
             "action_type": action,
-            "entity_id": entity["id"],
+            "entity_id": entity_id,
             "entity_name": name,
-            "entity_level": "adset",
+            # ⚠️ The rule's REAL level, not a hardcoded 'adset'. Stamping every
+            # row 'adset' meant execute_approved_action's `entity_level == "ad"`
+            # test never fired for a rules-engine pause, so an ad paused by a
+            # rule silently never got the replacement an identical autopilot
+            # pause would have built.
+            "entity_level": level,
             "metric": "rule",
-            "value_before": None,
-            "value_after": None,
+            "value_before": value_before,
+            "value_after": value_after,
             "reasoning": f"{why} (Rule: {rule.get('name')})",
             "status": "pending",
         }).execute()
     except Exception as e:
-        logger.error(f"[rules] Could not queue {action} on {entity.get('id')}: {e}")
+        logger.error(f"[rules] Could not queue {action} on {entity_id}: {e}")
 
 
 def _execute_action(

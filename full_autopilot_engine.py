@@ -1186,6 +1186,23 @@ def _execute_budget_action(
                 written = meta.set_budget(entity_id, new)
                 guards.record_budget_change(project_id, entity_id, entity_level, direction)
 
+            # ⚠️ Keep the account snapshot CURRENT, or the cap is measured against
+            # stale numbers for the rest of the run.
+            #
+            # account_budgets is read once before the loop and up to three budget
+            # actions are taken against it. Without this, each increase is checked
+            # against the pre-run totals, so three raises that each individually
+            # fit under max_account_daily_usd collectively sail past it. The cap
+            # is the number the customer was promised we would never exceed, so it
+            # has to hold across the whole run, not per action.
+            if account_budgets is not None:
+                for row in account_budgets:
+                    if row.get("id") == entity_id:
+                        row["daily_budget"] = written
+                        break
+                else:
+                    account_budgets.append({"id": entity_id, "daily_budget": written})
+
             value_before, value_after = round(current, 2), round(written, 2)
         elif action_type == "pause":
             if DRY_RUN:
