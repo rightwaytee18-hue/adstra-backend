@@ -204,7 +204,8 @@ def generate_for_project(project_id: str, mode: str, payload: dict) -> dict:
 
     rec = db.table('creative_generations').insert({
         'project_id': project_id,
-        'user_id': project['user_id'],
+        # NULL for Reveal tenant-owned projects. See 20260820000000.
+        'user_id': project.get('user_id') or None,
         'mode': mode,
         'prompt': payload.get('prompt') or payload.get('edit_prompt') or '',
         'image_url': url,

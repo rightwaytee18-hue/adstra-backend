@@ -101,18 +101,53 @@ def _ask_claude(system: str, user_message: str) -> str:
 # Weekly Briefing
 # ─────────────────────────────────────────────────────────────
 
-BRIEFING_SYSTEM = """\
-You are a senior performance marketing strategist writing a weekly briefing for an e-commerce founder.
+# The daily decision prompt was made goal-aware and this one was not, so every
+# customer received a briefing addressed to "an e-commerce founder" and written
+# around ROAS and orders. A plumber has no ROAS: Meta reports no revenue for a
+# lead, so the number is absent, not zero, and a briefing built around it either
+# reports nothing or invents something. The reader of this text is a business
+# owner who will act on it, which is exactly why it has to describe their
+# business and not a store.
+_BRIEFING_AUDIENCE = {
+    "purchase": (
+        "the founder of an online store",
+        "return on ad spend, orders and average order value",
+    ),
+    "lead": (
+        "the owner of a local service business",
+        "cost per enquiry, how many enquiries came in, and which ads produced "
+        "the ones worth having. This account has NO return on ad spend and NO "
+        "revenue figure, because Meta does not report revenue for an enquiry. "
+        "Never state, estimate or imply one",
+    ),
+    "awareness": (
+        "the owner of a business running an awareness campaign",
+        "reach, frequency and cost per thousand impressions. This account has "
+        "NO conversion, revenue or return on ad spend figure. Never invent one",
+    ),
+}
+
+
+def _briefing_system(goal: str) -> str:
+    audience, metrics = _BRIEFING_AUDIENCE.get(goal, _BRIEFING_AUDIENCE["lead"])
+    return f"""\
+You are a senior performance marketing strategist writing a weekly briefing for {audience}.
+
+Judge this account on {metrics}.
 
 Write a concise, actionable weekly briefing in Markdown (no H1, use H2 and H3 only).
 Include:
-1. **Performance Overview** — key numbers, vs last week if available, plain English
-2. **What's Working** — top 2-3 performers with specific reasoning
-3. **What Needs Attention** — top 2-3 issues or risks
-4. **This Week's Priority** — ONE clear action the founder should focus on
-5. **Quick Wins** — 2-3 small things they can do in <15 minutes
+1. **Performance Overview** - key numbers, vs last week if available, plain English
+2. **What's Working** - top 2-3 performers with specific reasoning
+3. **What Needs Attention** - top 2-3 issues or risks
+4. **This Week's Priority** - ONE clear action the owner should focus on
+5. **Quick Wins** - 2-3 small things they can do in under 15 minutes
 
-Be direct, confident, and specific. No fluff. Write like a trusted advisor, not a consultant.
+Write in plain language a busy owner reads once and acts on. Say "this ad cost
+$61 per enquiry when the rest of the account averages $22", never "CPA exceeds
+threshold". No jargon, no filler.
+
+Be direct, confident, and specific. Write like a trusted advisor, not a consultant.
 Max 500 words.
 """
 
@@ -127,7 +162,9 @@ def briefing_for_project(project_id: str) -> dict:
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
-    user_id = project.get("user_id", "")
+    # None, never "". uuid column; "" raises 22P02. Reveal tenant-owned
+    # projects legitimately have no auth user. See 20260820000000.
+    user_id = project.get("user_id") or None
     token = token_for(project)
     account = project.get("ad_account_id")
 
@@ -161,7 +198,10 @@ def briefing_for_project(project_id: str) -> dict:
     }
 
     try:
-        briefing_text = _ask_claude(BRIEFING_SYSTEM, json.dumps(snapshot, indent=2))
+        briefing_text = _ask_claude(
+            _briefing_system(project.get("goal") or "lead"),
+            json.dumps(snapshot, indent=2),
+        )
     except Exception as e:
         return {"ok": False, "error": f"AI failed: {e}"}
 
@@ -214,7 +254,7 @@ def _replace_after_pause(
         if not adset_id:
             return {"replacement_created": False}
 
-        user_id = action.get("user_id") or project.get("user_id", "")
+        user_id = action.get("user_id") or project.get("user_id") or None
         summary = {"creatives_generated": 0, "ads_created": 0, "errors": []}
         replacement_url = _generate_replacement(project, project_id, user_id, adset_id, summary)
         if replacement_url:

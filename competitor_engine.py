@@ -56,7 +56,7 @@ def run_for_project(project_id: str) -> dict:
 
     project = proj_resp.data
     competitors = project.get('competitors') or []
-    user_id = project['user_id']
+    user_id = project.get('user_id') or None
 
     if not competitors:
         return {'scraped': 0, 'message': 'No competitors configured'}

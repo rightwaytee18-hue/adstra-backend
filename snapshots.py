@@ -56,42 +56,71 @@ def write_daily_snapshot(
     campaigns: list[dict],
 ) -> int:
     """
-    Upsert one row per entity for today, plus one account-level total.
+    Upsert one row per entity PER DAY, plus one account-level total per day.
 
-    ⚠️ The account row is written explicitly rather than left for the portal to
+    Callers MUST pass rows from MetaClient.get_daily_insights, not get_insights.
+    Every row carries its own `day`, read from Meta's `date_start`.
+
+    This function used to take the aggregate reader's output and stamp every row
+    with today's date. Each of those rows covered the whole trailing window, so a
+    7-day window wrote 7 days of spend onto one calendar day, and the portal --
+    which sums 30 of these rows -- reported roughly 7x the money the customer was
+    actually charged. Rows arriving without a `day` are dropped and logged rather
+    than dated from the clock, so that failure can never come back silently.
+
+    The account row is written explicitly rather than left for the portal to
     compute. Summing ad, adset and campaign rows together counts the same dollar
     three times, so a portal that added up everything it found would show a
     customer three times the spend they were actually charged. With an account
     row present the portal reads that and nothing else for its totals.
 
-    ⚠️ The account total is summed from the AD level, not from campaigns. A
-    campaign with no ads still reports its own spend, but an ad whose campaign
-    row was truncated by the page cap would be missing entirely from a
-    campaign-level sum. Ads are the finest grain and do not overlap each other.
+    The account total is summed from the AD level, not from campaigns. A campaign
+    with no ads still reports its own spend, but an ad whose campaign row was
+    truncated by the page cap would be missing entirely from a campaign-level
+    sum. Ads are the finest grain and do not overlap each other.
 
     Upserted on (project_id, day, entity_level, entity_id) so re-running on the
     same day corrects the numbers rather than doubling them. That matters: the
-    daily job can legitimately run twice after a Railway restart.
+    daily job can legitimately run twice after a Railway restart, and it now
+    rewrites the whole window each run, which also repairs days a previous run
+    missed entirely.
     """
-    day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     rows: list[dict] = []
+    undated = 0
 
     for level, entities in (("ad", ads), ("adset", adsets), ("campaign", campaigns)):
         for e in entities or []:
-            if e.get("id"):
-                rows.append(_row(project_id, day, level, e))
+            if not e.get("id"):
+                continue
+            day = e.get("day")
+            if not day:
+                undated += 1
+                continue
+            rows.append(_row(project_id, day, level, e))
 
-    account = {
-        "id": "account",
-        "name": None,
-        "status": None,
-        "spend": sum(float(a.get("spend") or 0) for a in (ads or [])),
-        "impressions": sum(int(a.get("impressions") or 0) for a in (ads or [])),
-        "clicks": sum(int(a.get("clicks") or 0) for a in (ads or [])),
-        "results": sum(float(a.get("results") or 0) for a in (ads or [])),
-        "revenue": sum(float(a.get("revenue") or 0) for a in (ads or [])),
-    }
-    rows.append(_row(project_id, day, "account", account))
+    if undated:
+        logger.error(
+            f"[snapshot] {project_id}: dropped {undated} rows with no day. "
+            "Caller must use get_daily_insights, not get_insights."
+        )
+
+    # One account row per day the ads actually delivered on.
+    by_day: dict[str, list[dict]] = {}
+    for a in ads or []:
+        if a.get("id") and a.get("day"):
+            by_day.setdefault(a["day"], []).append(a)
+
+    for day, day_ads in by_day.items():
+        rows.append(_row(project_id, day, "account", {
+            "id": "account",
+            "name": None,
+            "status": None,
+            "spend": sum(float(a.get("spend") or 0) for a in day_ads),
+            "impressions": sum(int(a.get("impressions") or 0) for a in day_ads),
+            "clicks": sum(int(a.get("clicks") or 0) for a in day_ads),
+            "results": sum(float(a.get("results") or 0) for a in day_ads),
+            "revenue": sum(float(a.get("revenue") or 0) for a in day_ads),
+        }))
 
     if not rows:
         return 0
@@ -100,7 +129,9 @@ def write_daily_snapshot(
         get_db().table("ad_insights_daily").upsert(
             rows, on_conflict="project_id,day,entity_level,entity_id"
         ).execute()
-        logger.info(f"[snapshot] {project_id}: wrote {len(rows)} rows for {day}")
+        logger.info(
+            f"[snapshot] {project_id}: wrote {len(rows)} rows across {len(by_day)} days"
+        )
         return len(rows)
     except Exception as e:
         # Non-fatal to the optimization run. The customer's dashboard going

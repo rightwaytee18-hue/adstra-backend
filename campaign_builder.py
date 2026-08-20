@@ -9,6 +9,7 @@ so they work regardless of the user's JWT state.
 
 import logging
 from typing import Optional
+from conversions import GOALS, campaign_shape
 from crypto import token_for
 from db import get_db
 from meta_client import MetaClient, MetaAPIError
@@ -21,6 +22,20 @@ TEMPLATE_MAP = {
     "leads":     ("OUTCOME_LEADS",     "LEAD_GENERATION"),
     "traffic":   ("OUTCOME_TRAFFIC",   "LINK_CLICKS"),
     "awareness": ("OUTCOME_AWARENESS", "REACH"),
+}
+
+# Which pixel event each template asks Meta to OPTIMIZE for.
+#
+# This was the literal "PURCHASE" for both the sales and the leads template, so
+# a service business's ad set was told to chase an event their pixel will never
+# fire. That is worse than sending no promoted_object at all: Meta optimizes
+# toward a signal it never receives, so delivery never leaves the learning phase.
+#
+# Derived from conversions.campaign_shape rather than written out again, so the
+# side that COUNTS a result and the side that ASKS for one cannot drift.
+TEMPLATE_EVENT = {
+    shape["template_key"]: shape["custom_event_type"]
+    for shape in (campaign_shape(goal) for goal in GOALS)
 }
 
 DEFAULT_ATTRIBUTION = [
@@ -150,8 +165,9 @@ def publish_for_project(project_id: str, draft: dict) -> dict:
     # --- Step 2: Create ad set ---
     try:
         promoted_object = None
-        if template_key in ("sales", "leads") and pixel_id:
-            promoted_object = {"pixel_id": pixel_id, "custom_event_type": "PURCHASE"}
+        event_type = TEMPLATE_EVENT.get(template_key)
+        if event_type and pixel_id:
+            promoted_object = {"pixel_id": pixel_id, "custom_event_type": event_type}
 
         abo_budget = daily_budget_cents if budget_mode == "abo" else None
         bid_amount = draft.get("target_cpa_cents") if bid_strategy == "COST_CAP" else None

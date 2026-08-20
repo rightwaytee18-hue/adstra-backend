@@ -158,49 +158,44 @@ class MetaClient:
     # READ helpers (rules engine)                                         #
     # ------------------------------------------------------------------ #
 
-    def get_insights(self, level: str, window_days: int, goal: str = "lead") -> list[dict]:
-        """
-        Insights for every entity at `level`, with results counted for `goal`.
+    # Every metric the two insight readers below ask Meta for. Kept in one place
+    # so the aggregate read and the per-day read cannot drift apart.
+    _INSIGHT_METRICS = "spend,impressions,clicks,ctr,frequency,cpm,actions,action_values"
 
-        `goal` defaults to 'lead' rather than 'purchase' because the safe failure
-        is under-reporting revenue on an ecommerce account, not reporting zero
-        results forever on a service business. See conversions.py.
-        """
+    @staticmethod
+    def _base_fields(level: str) -> str:
+        """Parent-entity ids are only valid fields on the endpoints that have them."""
+        base = "id,name,status,effective_status"
+        if level == "ad":
+            base += ",adset_id,campaign_id"
+        elif level == "adset":
+            base += ",campaign_id"
+        return base
+
+    @staticmethod
+    def _window(window_days: int) -> str:
         now = datetime.utcnow()
         since = (now - timedelta(days=window_days)).strftime("%Y-%m-%d")
         until = now.strftime("%Y-%m-%d")
-        time_range = json.dumps({"since": since, "until": until})
+        return json.dumps({"since": since, "until": until})
 
-        endpoint_map = {
+    def _paged_entities(self, level: str, fields: str) -> list[dict]:
+        """
+        Every entity at `level`, following cursor pagination.
+
+        Accounts with more than 200 entities were silently truncated before this
+        loop existed, which hid ads from analysis and broke the CBO map.
+        """
+        endpoint = {
             "campaign": f"{self.account}/campaigns",
             "adset": f"{self.account}/adsets",
             "ad": f"{self.account}/ads",
-        }
-        endpoint = endpoint_map[level]
+        }[level]
 
-        # Parent-entity ids are only valid fields on the endpoints that have them.
-        base_fields = "id,name,status,effective_status"
-        if level == "ad":
-            base_fields += ",adset_id,campaign_id"
-        elif level == "adset":
-            base_fields += ",campaign_id"
-
-        params = {
-            "fields": (
-                f"{base_fields},"
-                f"insights.time_range({time_range}){{"
-                "spend,impressions,clicks,ctr,frequency,cpm,"
-                "actions,action_values"
-                "}}"
-            ),
-            "limit": 200,
-        }
-
-        # Follow cursor pagination so accounts with >200 entities are not silently
-        # truncated (which would hide ads from analysis and break the CBO map).
+        params = {"fields": fields, "limit": 200}
         raw_items: list[dict] = []
         pages = 0
-        MAX_PAGES = 25  # safety cap → up to ~5000 entities
+        MAX_PAGES = 25  # safety cap -> up to ~5000 entities
         while True:
             resp = self._get(endpoint, params)
             raw_items.extend(resp.get("data", []))
@@ -210,60 +205,119 @@ class MetaClient:
             if not paging.get("next") or not after or pages >= MAX_PAGES:
                 if paging.get("next") and pages >= MAX_PAGES:
                     logger.warning(
-                        f"[meta] get_insights({level}) hit page cap ({MAX_PAGES}) — results truncated"
+                        f"[meta] {level} listing hit page cap ({MAX_PAGES}) - results truncated"
                     )
                 break
             params = {**params, "after": after}
+        return raw_items
+
+    def _shape(self, item: dict, ins: dict, goal: str) -> dict:
+        """One Meta entity plus one insights row, in the shape every caller reads."""
+        # Counted per goal, and de-duplicated within each action family.
+        # Previously this read the single action type "purchase", which is
+        # always absent on a lead-gen account, so every service business
+        # measured 0 results and 0.0 ROAS. See conversions.py.
+        derived = derive(ins, goal)
+
+        return {
+            "id": item["id"],
+            "name": item.get("name", ""),
+            "status": item.get("effective_status", ""),
+            "adset_id": item.get("adset_id"),
+            "campaign_id": item.get("campaign_id"),
+            "spend": float(ins.get("spend", 0) or 0),
+            # None for any non-purchase goal. Callers MUST skip a None
+            # rather than compare it; treating it as 0.0 is what made the
+            # kill rule match every lead-gen ad.
+            "roas": derived["roas"],
+            "cpa": derived["cpa"],
+            "cost_per_result": derived["cost_per_result"],
+            "results": derived["results"],
+            "revenue": derived["revenue"],
+            "goal": goal,
+            "cpm": float(ins.get("cpm", 0) or 0),
+            "ctr": float(ins.get("ctr", 0) or 0),
+            "frequency": float(ins.get("frequency", 0) or 0),
+            # These were parsed into locals and then dropped on the floor.
+            # snapshots._row reads them by name, so every ad_insights_daily
+            # row recorded 0 impressions and 0 clicks, and the portal showed
+            # zeroes for both forever.
+            "impressions": int(ins.get("impressions", 0) or 0),
+            "clicks": int(ins.get("clicks", 0) or 0),
+            # Kept so anything still reading `purchases` keeps working. On a
+            # lead goal this is the count of enquiries, not orders.
+            "purchases": int(derived["results"]),
+        }
+
+    def get_insights(self, level: str, window_days: int, goal: str = "lead") -> list[dict]:
+        """
+        ONE aggregate row per entity, covering the whole trailing window.
+
+        This is what the DECISION path reads, and it is the only read whose
+        `frequency` is meaningful: frequency is impressions over reach, and reach
+        cannot be summed across days, so a per-day read can never be re-totalled
+        into this one.
+
+        Do NOT feed this to the dashboard. Every row covers `window_days` of
+        delivery, so stamping it against a single calendar day reports up to
+        `window_days` times the real spend. Use get_daily_insights.
+
+        `goal` defaults to 'lead' rather than 'purchase' because the safe failure
+        is under-reporting revenue on an ecommerce account, not reporting zero
+        results forever on a service business. See conversions.py.
+        """
+        fields = (
+            f"{self._base_fields(level)},"
+            f"insights.time_range({self._window(window_days)})"
+            f"{{{self._INSIGHT_METRICS}}}"
+        )
 
         results = []
-        for item in raw_items:
+        for item in self._paged_entities(level, fields):
             if item.get("effective_status") not in ("ACTIVE", "PAUSED"):
                 continue
             ins = (item.get("insights", {}).get("data") or [{}])[0]
-            spend = float(ins.get("spend", 0))
-            impressions = int(ins.get("impressions", 0))
-            clicks = int(ins.get("clicks", 0))
-            ctr = float(ins.get("ctr", 0))
-            cpm = float(ins.get("cpm", 0))
-            frequency = float(ins.get("frequency", 0))
-
-            # Counted per goal, and de-duplicated within each action family.
-            # Previously this read the single action type "purchase", which is
-            # always absent on a lead-gen account, so every service business
-            # measured 0 results and 0.0 ROAS. See conversions.py.
-            derived = derive(ins, goal)
-
-            results.append({
-                "id": item["id"],
-                "name": item.get("name", ""),
-                "status": item.get("effective_status", ""),
-                "adset_id": item.get("adset_id"),
-                "campaign_id": item.get("campaign_id"),
-                "spend": spend,
-                # None for any non-purchase goal. Callers MUST skip a None
-                # rather than compare it; treating it as 0.0 is what made the
-                # kill rule match every lead-gen ad.
-                "roas": derived["roas"],
-                "cpa": derived["cpa"],
-                "cost_per_result": derived["cost_per_result"],
-                "results": derived["results"],
-                "revenue": derived["revenue"],
-                "goal": goal,
-                "cpm": cpm,
-                "ctr": ctr,
-                "frequency": frequency,
-                # ⚠️ These were parsed into locals and then dropped on the floor.
-                # snapshots._row reads them by name, so every ad_insights_daily
-                # row recorded 0 impressions and 0 clicks, and the portal showed
-                # zeroes for both forever.
-                "impressions": impressions,
-                "clicks": clicks,
-                # Kept so anything still reading `purchases` keeps working. On a
-                # lead goal this is the count of enquiries, not orders.
-                "purchases": int(derived["results"]),
-            })
+            results.append(self._shape(item, ins, goal))
 
         return results
+
+    def get_daily_insights(self, level: str, window_days: int, goal: str = "lead") -> list[dict]:
+        """
+        One row per entity PER CALENDAR DAY. This is what the dashboard reads.
+
+        `.time_increment(1)` is the entire point of this method. Without it Meta
+        collapses the requested range into a single row, and a snapshot writer
+        that stamps that row with today's date reports a whole window of spend as
+        one day's spend. That bug was live and inflated reported spend by roughly
+        the window length.
+
+        Every row carries `day`, taken from Meta's own `date_start` and never
+        from the clock on this machine, so a run that straddles midnight UTC or
+        is re-run after a restart lands each row on the day it actually belongs
+        to. The snapshot upserts on (project, day, level, entity), so re-running
+        corrects rather than doubles.
+
+        A day on which an entity did not deliver simply has no row. Absent is not
+        zero, and writing a zero would tell a customer their ad ran and failed on
+        a day it was not running at all.
+        """
+        fields = (
+            f"{self._base_fields(level)},"
+            f"insights.time_range({self._window(window_days)}).time_increment(1)"
+            f"{{{self._INSIGHT_METRICS},date_start}}"
+        )
+
+        rows = []
+        for item in self._paged_entities(level, fields):
+            if item.get("effective_status") not in ("ACTIVE", "PAUSED"):
+                continue
+            for ins in (item.get("insights", {}).get("data") or []):
+                day = ins.get("date_start")
+                if not day:
+                    continue
+                rows.append({**self._shape(item, ins, goal), "day": day})
+
+        return rows
 
     def get_adset_budget(self, adset_id: str) -> float:
         return self.get_entity_budget(adset_id)

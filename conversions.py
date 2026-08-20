@@ -174,3 +174,63 @@ def derive(insights: dict, goal: str) -> dict:
         "cpa": cost_per_result,
         "goal": goal,
     }
+
+
+# ─────────────────────────────────────────────────────────────
+# How a goal is BUILT, not just counted.
+# ─────────────────────────────────────────────────────────────
+# The counting half of this file was made goal-aware and the building half was
+# not, so every campaign the engine published was constructed as if the customer
+# ran an online store:
+#
+#   - the bootstrap draft hardcoded template_key "sales" / OUTCOME_SALES
+#   - the ad set sent custom_event_type PURCHASE even on the "leads" template,
+#     so a plumber's ad set was told to optimize for an event their pixel will
+#     never fire, which is worse than no promoted_object at all
+#   - every replacement ad read "Shop {business} now" with a SHOP_NOW button
+#
+# Keeping this beside GOALS and _GOAL_FAMILIES means the account that counts
+# leads and the campaign that asks for leads cannot disagree.
+
+_CAMPAIGN_SHAPES: dict[str, dict] = {
+    "purchase": {
+        "template_key": "sales",
+        "objective": "OUTCOME_SALES",
+        "custom_event_type": "PURCHASE",
+        "cta_type": "SHOP_NOW",
+        "message": "Shop {business} now",
+    },
+    "lead": {
+        "template_key": "leads",
+        "objective": "OUTCOME_LEADS",
+        "custom_event_type": "LEAD",
+        # LEARN_MORE and not GET_QUOTE, deliberately. GET_QUOTE reads better for
+        # a trades business, but CTA validity varies by objective and placement
+        # and an invalid call_to_action fails the whole ad creation, which would
+        # trade a bad button for no ad at all. Revisit once there is a live
+        # account to test against. Buyer-led creative replaces this copy wholesale.
+        "cta_type": "LEARN_MORE",
+        "message": "Request a quote from {business}",
+    },
+    "awareness": {
+        "template_key": "awareness",
+        "objective": "OUTCOME_AWARENESS",
+        # No pixel event. An awareness campaign optimizing for a conversion is a
+        # contradiction, and promoted_object is omitted entirely.
+        "custom_event_type": None,
+        "cta_type": "LEARN_MORE",
+        "message": "{business}",
+    },
+}
+
+
+def campaign_shape(goal: Optional[str]) -> dict:
+    """
+    Objective, optimization event and default copy for a goal.
+
+    Defaults to 'lead' for the same reason goal_from_intake does: almost every
+    business Reveal sells to is a service business, and the safe failure is
+    under-reporting an ecommerce account rather than pointing a plumber's budget
+    at a purchase event that never fires.
+    """
+    return _CAMPAIGN_SHAPES.get((goal or "").strip().lower(), _CAMPAIGN_SHAPES["lead"])

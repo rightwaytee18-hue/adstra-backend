@@ -39,6 +39,7 @@ import guards
 from crypto import token_for
 from db import get_db
 from meta_client import MetaClient, MetaAPIError
+from conversions import campaign_shape
 from snapshots import write_daily_snapshot
 
 logger = logging.getLogger(__name__)
@@ -233,7 +234,11 @@ def bootstrap_project(project_id: str) -> dict:
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
-    user_id = project.get("user_id", "")
+    # None, never "". These columns are uuid; an empty string raises 22P02
+    # (invalid input syntax) on every insert, and _save_action is unguarded,
+    # so the whole daily run died the first time it tried to queue an action.
+    # Reveal tenant-owned projects legitimately have no auth user.
+    user_id = project.get("user_id") or None
 
     # Idempotency guard — never run bootstrap twice
     settings = _load_settings(project_id)
@@ -344,10 +349,15 @@ def bootstrap_project(project_id: str) -> dict:
             business_name = project.get("business_name") or "Our Brand"
             store_url = project.get("store_url") or project.get("website") or ""
 
+            # The launch draft was hardcoded to the ecommerce shape regardless of
+            # projects.goal, so every service business Reveal onboarded had its
+            # first campaign published as OUTCOME_SALES with a SHOP_NOW button.
+            shape = campaign_shape(project.get("goal"))
+
             draft = {
                 "name": f"{business_name} — Autopilot Launch",
-                "template_key": "sales",
-                "objective": "OUTCOME_SALES",
+                "template_key": shape["template_key"],
+                "objective": shape["objective"],
                 "countries": project.get("target_countries") or ["US"],
                 "age_min": project.get("target_age_min") or 18,
                 "age_max": project.get("target_age_max") or 65,
@@ -356,7 +366,7 @@ def bootstrap_project(project_id: str) -> dict:
                 "budget_mode": "cbo",
                 "bid_strategy": "LOWEST_COST_WITHOUT_CAP",
                 "link_url": store_url,
-                "cta_type": "SHOP_NOW",
+                "cta_type": shape["cta_type"],
                 "creatives": creatives_for_campaign,
             }
 
@@ -565,7 +575,11 @@ def run_full_daily(project_id: str) -> dict:
         logger.error(f"[daily] Could not load project {project_id}: {e}")
         return {"project_id": project_id, "skipped_reason": str(e)}
 
-    user_id = project.get("user_id", "")
+    # None, never "". These columns are uuid; an empty string raises 22P02
+    # (invalid input syntax) on every insert, and _save_action is unguarded,
+    # so the whole daily run died the first time it tried to queue an action.
+    # Reveal tenant-owned projects legitimately have no auth user.
+    user_id = project.get("user_id") or None
     token = token_for(project)
     account = project.get("ad_account_id")
 
@@ -648,7 +662,27 @@ def run_full_daily(project_id: str) -> dict:
     # Written BEFORE the decision step and before the early return below, so the
     # customer's dashboard fills in on a day when the model decides nothing needs
     # doing. Reporting is not a side effect of taking an action.
-    summary["snapshot_rows"] = write_daily_snapshot(project_id, ads, adsets, campaigns)
+    #
+    # A SECOND read, deliberately. The rows above are one aggregate per entity
+    # covering the whole window, which is what the decision path needs and what
+    # keeps `frequency` meaningful. The dashboard needs one row per calendar day,
+    # and the two cannot be derived from each other. Feeding the aggregate rows
+    # to the snapshot is what made reported spend roughly `window_days` times the
+    # real figure. Never pass `ads` here.
+    #
+    # Wrapped separately so a reporting failure cannot stop the optimizer from
+    # pausing a money-losing ad.
+    try:
+        snap_days = max(window_days, 7)
+        summary["snapshot_rows"] = write_daily_snapshot(
+            project_id,
+            meta.get_daily_insights("ad", snap_days, goal=goal),
+            meta.get_daily_insights("adset", snap_days, goal=goal),
+            meta.get_daily_insights("campaign", snap_days, goal=goal),
+        )
+    except Exception as e:
+        logger.error(f"[daily] Snapshot read failed (non-fatal): {e}")
+        summary["errors"].append(f"Snapshot: {e}")
 
     if not ads and not adsets:
         summary["skipped_reason"] = "No active ads or ad sets"
@@ -1014,16 +1048,20 @@ def _upload_and_create_ad(
         store_url = project.get("store_url") or project.get("website") or ""
         timestamp_label = datetime.now(timezone.utc).strftime("%m/%d")
 
+        # Every autopilot replacement ad on every account read "Shop {business}
+        # now" with a SHOP_NOW button, including on plumbers and body shops.
+        shape = campaign_shape(project.get("goal"))
+
         image_hash = meta.upload_image_from_url(image_url, f"autopilot_{int(datetime.now(timezone.utc).timestamp())}.jpg")
 
         creative_id = meta.create_ad_creative(
             name=f"Autopilot Creative — {timestamp_label}",
             image_hash=image_hash,
             link=store_url,
-            message=f"Shop {business_name} now →",
+            message=shape["message"].format(business=business_name),
             headline=business_name,
             description=None,
-            cta_type="SHOP_NOW",
+            cta_type=shape["cta_type"],
         )
 
         ad_name = f"Replacement {timestamp_label}"
