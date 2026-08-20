@@ -18,6 +18,10 @@ from rules_engine import run_for_project
 from competitor_engine import run_for_project as scrape_for_project
 from creative_engine import generate_for_project
 from campaign_builder import preflight_for_project, publish_for_project
+# Surfaced on /health so a deploy can be checked without guessing which Marketing
+# API version the running container is pinned to. reveal/lib/ads/meta/oauth.ts must
+# match it; the two halves sat on a dead version for months once already.
+from meta_client import API_VERSION
 from autopilot_engine import (
     briefing_for_project,
     execute_approved_action,
@@ -64,7 +68,26 @@ def verify_secret(x_api_secret: str = Header(...)):
 
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    """
+    Liveness, plus WHICH BUILD is answering.
+
+    "status: ok" alone cannot distinguish a successful deploy from a failed one:
+    a build that never shipped leaves the previous container running and it
+    answers ok exactly the same way. Railway injects RAILWAY_GIT_COMMIT_SHA, so
+    returning it turns "did my fix actually deploy" from a guess into a diff
+    against `git rev-parse HEAD`.
+
+    Unauthenticated, like the rest of this endpoint, so the sha is deliberately
+    truncated: enough to match a local commit, not a full pointer into a private
+    repo's history.
+    """
+    sha = os.environ.get("RAILWAY_GIT_COMMIT_SHA", "")
+    return {
+        "status": "ok",
+        "commit": sha[:7] if sha else "unknown",
+        "meta_api": API_VERSION,
+        "dry_run": os.environ.get("AUTOPILOT_DRY_RUN", "").lower() in ("1", "true", "yes"),
+    }
 
 
 # ─────────────────────────────────────────────────────────────
