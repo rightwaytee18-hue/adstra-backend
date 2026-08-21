@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 import guards
-from crypto import token_for
+from crypto import token_for_project
 from db import get_db
 from meta_client import MetaClient
 
@@ -51,13 +51,17 @@ def run_for_project(project_id: str) -> list[dict]:
         # legacy profile-owned project's customer could never see the decision
         # while the rules engine re-queued it every six hours. Reveal tenants are
         # unaffected (they have no auth user by design) but the column still has
-        # to be selected to be read.
-        "id,user_id,meta_access_token,meta_access_token_enc,ad_account_id,"
-        "meta_connected,target_roas,target_cpa,daily_budget_cap,goal"
+        # to be selected to be read. ad_credential_id is the same trap: this is
+        # the ONLY project loader in the codebase using a named list rather than
+        # select("*"), so a column added to the resolution path has to be added
+        # here too or the six-hourly rules engine silently sees every
+        # agency-credentialled project as disconnected while the daily loop works.
+        "id,user_id,meta_access_token,meta_access_token_enc,ad_credential_id,"
+        "ad_account_id,meta_connected,target_roas,target_cpa,daily_budget_cap,goal"
     ).eq("id", project_id).maybe_single().execute()
 
     project = proj_resp.data if proj_resp else None
-    token = token_for(project) if project else None
+    token = token_for_project(project) if project else None
     if not project or not project.get("meta_connected") or not token:
         logger.info(f"Project {project_id} not Meta-connected, skipping.")
         return []

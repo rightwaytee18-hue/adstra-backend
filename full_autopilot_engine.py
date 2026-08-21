@@ -36,9 +36,10 @@ from typing import Optional
 import anthropic
 
 import guards
-from crypto import token_for
+from crypto import token_for_project
 from db import get_db
 from meta_client import MetaClient, MetaAPIError
+from ad_entities import reconcile_entities
 from conversions import campaign_shape
 from snapshots import write_daily_snapshot
 
@@ -338,7 +339,7 @@ def bootstrap_project(project_id: str) -> dict:
         # Can't publish without creatives — skip but don't fail
         steps.append({"step": "campaign", "status": "skipped", "detail": "No creatives available"})
         logger.warning(f"[bootstrap] No creatives — skipping campaign publish for {project_id}")
-    elif not project.get("meta_connected") or not token_for(project):
+    elif not project.get("meta_connected") or not token_for_project(project):
         steps.append({"step": "campaign", "status": "skipped", "detail": "Meta not connected"})
         logger.warning(f"[bootstrap] Meta not connected — skipping campaign publish for {project_id}")
     else:
@@ -580,7 +581,7 @@ def run_full_daily(project_id: str) -> dict:
     # so the whole daily run died the first time it tried to queue an action.
     # Reveal tenant-owned projects legitimately have no auth user.
     user_id = project.get("user_id") or None
-    token = token_for(project)
+    token = token_for_project(project)
     account = project.get("ad_account_id")
 
     if not token or not account or not project.get("meta_connected"):
@@ -674,11 +675,18 @@ def run_full_daily(project_id: str) -> dict:
     # pausing a money-losing ad.
     try:
         snap_days = max(window_days, 7)
+        daily_ads = meta.get_daily_insights("ad", snap_days, goal=goal)
+        daily_adsets = meta.get_daily_insights("adset", snap_days, goal=goal)
+        daily_campaigns = meta.get_daily_insights("campaign", snap_days, goal=goal)
         summary["snapshot_rows"] = write_daily_snapshot(
-            project_id,
-            meta.get_daily_insights("ad", snap_days, goal=goal),
-            meta.get_daily_insights("adset", snap_days, goal=goal),
-            meta.get_daily_insights("campaign", snap_days, goal=goal),
+            project_id, daily_ads, daily_adsets, daily_campaigns
+        )
+        # Register anything the registry has not seen. publish_for_project covers
+        # what this engine created; this covers what a human created by hand in
+        # Ads Manager, and an ad the registry has never heard of is an ad whose
+        # spend can never be attributed to a lead.
+        summary["entities_seen"] = reconcile_entities(
+            project_id, daily_ads, daily_adsets, daily_campaigns
         )
     except Exception as e:
         logger.error(f"[daily] Snapshot read failed (non-fatal): {e}")

@@ -8,9 +8,11 @@ so they work regardless of the user's JWT state.
 """
 
 import logging
+import re
 from typing import Optional
+from ad_entities import mint_utm_key, tagged_destination, upsert_entity
 from conversions import GOALS, campaign_shape
-from crypto import token_for
+from crypto import token_for_project
 from db import get_db
 from meta_client import MetaClient, MetaAPIError
 
@@ -56,7 +58,7 @@ def _load_project(project_id: str) -> dict:
 def preflight_for_project(project_id: str, draft: dict) -> dict:
     """Run validation reads only. Returns {ok, steps[]}."""
     project = _load_project(project_id)
-    token = token_for(project)
+    token = token_for_project(project)
     account = project.get("ad_account_id")
     page_id = project.get("facebook_page_id")
     pixel_id = project.get("pixel_id")
@@ -91,7 +93,7 @@ def publish_for_project(project_id: str, draft: dict) -> dict:
     }
     """
     project = _load_project(project_id)
-    token = token_for(project)
+    token = token_for_project(project)
     account = project.get("ad_account_id")
     page_id = project.get("facebook_page_id")
     pixel_id = project.get("pixel_id")
@@ -126,11 +128,21 @@ def publish_for_project(project_id: str, draft: dict) -> dict:
 
     client = MetaClient(token, account, page_id=page_id)
 
-    # Build destination URL
+    # Build destination URL.
+    #
+    # Any hand-supplied utm_params are folded in first, then each creative gets
+    # its OWN minted key appended inside the loop below. One destination shared
+    # by every ad in the campaign would make every lead trace back to "this
+    # campaign" and no further, which is the resolution the platform already
+    # gives us for free and is not enough to score a creative.
     destination = link_url
     if utm_params:
         sep = "&" if "?" in destination else "?"
         destination = f"{destination}{sep}{utm_params}"
+
+    # Slug for utm_campaign. Readable in the customer's own analytics, which is
+    # where they will go looking when they ask where a lead came from.
+    campaign_slug = re.sub(r"[^a-z0-9]+", "-", (campaign_name or "").lower()).strip("-")[:40]
 
     # Build targeting
     targeting: dict = {
@@ -158,6 +170,7 @@ def publish_for_project(project_id: str, draft: dict) -> dict:
         )
         steps.append({"step": "campaign", "status": "ok", "detail": campaign_id})
         logger.info(f"[campaign_builder] Created campaign {campaign_id} for project {project_id}")
+        upsert_entity(project_id, "campaign", campaign_id, name=campaign_name, status="PAUSED")
     except MetaAPIError as e:
         steps.append({"step": "campaign", "status": "error", "detail": str(e)})
         return {"ok": False, "fatal": str(e), "campaign_id": None, "adset_id": None, "ad_ids": [], "steps": steps, "errors": [str(e)]}
@@ -185,6 +198,8 @@ def publish_for_project(project_id: str, draft: dict) -> dict:
         )
         steps.append({"step": "adset", "status": "ok", "detail": adset_id})
         logger.info(f"[campaign_builder] Created adset {adset_id}")
+        upsert_entity(project_id, "adset", adset_id, parent_meta_id=campaign_id,
+                      name=draft.get("adset_name") or campaign_name, status="PAUSED")
     except MetaAPIError as e:
         steps.append({"step": "adset", "status": "error", "detail": str(e)})
         # Campaign created but adset failed — record partial result
@@ -198,6 +213,13 @@ def publish_for_project(project_id: str, draft: dict) -> dict:
         message = creative.get("message", "")
         description = creative.get("description", "")
         ad_num = i + 1
+
+        # Minted BEFORE the creative, because the creative carries the URL and the
+        # ad id does not exist until after it. This key is the only identifier we
+        # control, and it is written onto the ad_entities row below alongside the
+        # ad id Meta hands back, which is what joins the two.
+        utm_content = mint_utm_key()
+        ad_destination = tagged_destination(destination, utm_content, campaign_slug)
 
         # Upload image
         try:
@@ -215,7 +237,7 @@ def publish_for_project(project_id: str, draft: dict) -> dict:
             creative_id = client.create_ad_creative(
                 name=f"Creative {ad_num} - {headline[:40]}",
                 image_hash=image_hash,
-                link=destination,
+                link=ad_destination,
                 message=message,
                 headline=headline,
                 description=description or None,
@@ -239,6 +261,19 @@ def publish_for_project(project_id: str, draft: dict) -> dict:
             steps.append({"step": f"ad_{ad_num}", "status": "ok", "detail": ad_id})
             ad_ids.append(ad_id)
             logger.info(f"[campaign_builder] Created ad {ad_id}")
+            # The join key and the ad it belongs to, written together. Until this
+            # row exists a lead carrying utm_content has nothing to resolve to.
+            upsert_entity(
+                project_id, "ad", ad_id,
+                parent_meta_id=adset_id,
+                name=f"{campaign_name} - Ad {ad_num}",
+                status="PAUSED",
+                meta_creative_id=creative_id,
+                meta_image_hash=image_hash,
+                creative_generation_id=creative.get("creative_generation_id"),
+                hypothesis_id=creative.get("hypothesis_id"),
+                utm_content=utm_content,
+            )
         except MetaAPIError as e:
             err = f"Ad {ad_num} creation failed: {e}"
             steps.append({"step": f"ad_{ad_num}", "status": "error", "detail": str(e)})

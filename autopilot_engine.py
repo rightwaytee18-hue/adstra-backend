@@ -19,7 +19,7 @@ from typing import Optional
 import anthropic
 
 import guards
-from crypto import token_for
+from crypto import token_for_project
 from db import get_db
 from meta_client import MetaClient, MetaAPIError
 
@@ -165,7 +165,7 @@ def briefing_for_project(project_id: str) -> dict:
     # None, never "". uuid column; "" raises 22P02. Reveal tenant-owned
     # projects legitimately have no auth user. See 20260820000000.
     user_id = project.get("user_id") or None
-    token = token_for(project)
+    token = token_for_project(project)
     account = project.get("ad_account_id")
 
     if not token or not account or not project.get("meta_connected"):
@@ -317,7 +317,7 @@ def execute_approved_action(action_id: str, project_id: str) -> dict:
         project = _load_project(project_id)
         settings = _load_settings(project_id) or {}
 
-        token = token_for(project)
+        token = token_for_project(project)
         account = project.get("ad_account_id")
         if not token or not account or not project.get("meta_connected"):
             raise MetaAPIError("Meta not connected for this project")

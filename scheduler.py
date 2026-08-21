@@ -25,6 +25,14 @@ def _run_competitor_job():
         logger.error(f"Scheduled competitor scrape error: {e}")
 
 
+def _run_credential_health_job() -> None:
+    try:
+        from credential_health import run_all
+        run_all()
+    except Exception as e:
+        logger.error(f"[scheduler] credential health failed: {e}")
+
+
 def _run_autopilot_job():
     """Daily full autopilot — bootstrap new projects, optimize existing ones."""
     try:
@@ -64,6 +72,10 @@ def start():
 
     # Phase 8: Autopilot (daily at 6 AM UTC)
     _scheduler.add_job(_run_autopilot_job,       "cron", hour=6, minute=0, id="autopilot_job",  replace_existing=True)
+    # 05:30, deliberately half an hour BEFORE the autopilot run. A credential that
+    # died overnight should be a logged, visible failure rather than the reason
+    # every project in the 06:00 loop quietly did nothing.
+    _scheduler.add_job(_run_credential_health_job, "cron", hour=5, minute=30, id="cred_health_job", replace_existing=True)
 
     # Phase 8: Weekly briefing (every Monday at 8 AM UTC)
     _scheduler.add_job(_run_weekly_briefing_job, "cron", day_of_week="mon", hour=8, minute=0, id="briefing_job", replace_existing=True)

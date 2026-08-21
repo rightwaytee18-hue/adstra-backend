@@ -85,25 +85,69 @@ def decrypt_token(payload: str) -> str:
         raise TokenCryptoError(f"token decrypt failed: {e}")
 
 
-def token_for(project: dict) -> Optional[str]:
+def token_for_project(project: Optional[dict]) -> Optional[str]:
     """
-    The usable Meta token for a project row, encrypted first.
+    The usable Meta token for a project, including an AGENCY-level credential.
 
-    Falls back to the legacy plaintext column ONLY when there is no encrypted
-    value, so an account connected before 2026-08-16 keeps working until it
-    reconnects. A row carrying both is treated as encrypted: the callback nulls
-    the plaintext column on every reconnect, so a leftover value there is stale
-    by definition.
+    Resolution order, additive so nothing that works today regresses:
 
-    Returns None rather than raising when nothing is stored, because "not
-    connected yet" is an ordinary state that every caller already handles. A
-    decrypt that FAILS does raise, because silently treating a corrupt token as
-    "not connected" would show the customer a setup screen forever with no
-    explanation.
+      1. projects.meta_access_token_enc   this client's own OAuth token
+      2. projects.ad_credential_id        the agency credential covering many
+                                          clients at once
+      3. projects.meta_access_token       legacy plaintext, pre-2026-08-16
+
+    The client's own token wins deliberately. A business that connected its own
+    ad account has given consent directly, and an agency credential arriving
+    later must not quietly start acting on that consent instead.
+
+    ⚠️ CALLERS MUST SELECT `ad_credential_id`. Two loaders in this codebase read
+    a NAMED column list rather than `*` (rules_engine and the daily loop), and a
+    column that is not selected reads as None with no error. That is exactly how
+    user_id ended up null on every queued action for months. If the column is
+    absent this falls through to the legacy branch and the project looks
+    disconnected, so the failure is at least visible rather than wrong.
+
+    Returns None when nothing is stored. Raises when something IS stored and
+    cannot be decrypted, because treating a corrupt token as "not connected"
+    shows the customer a setup screen forever with no explanation.
     """
+    if not project:
+        return None
+
     enc = project.get("meta_access_token_enc")
     if enc:
         return decrypt_token(enc)
+
+    credential_id = project.get("ad_credential_id")
+    if credential_id:
+        # Imported here rather than at module scope so this file stays importable
+        # without supabase installed, which is what lets the crypto round trip be
+        # tested on its own.
+        from db import get_db
+
+        resp = (
+            get_db()
+            .table("ad_platform_credentials")
+            .select("id,token_enc,revoked_at,expires_at")
+            .eq("id", credential_id)
+            .maybe_single()
+            .execute()
+        )
+        row = resp.data if resp else None
+        if not row:
+            logger.error(
+                "[crypto] project %s points at credential %s, which does not exist",
+                project.get("id"), credential_id,
+            )
+        elif row.get("revoked_at"):
+            # Fail loudly rather than falling through to a legacy token. A
+            # revoked credential means someone deliberately cut access, and
+            # quietly reaching for an older token would undo that decision.
+            raise TokenCryptoError(
+                f"agency credential {credential_id} was revoked at {row['revoked_at']}"
+            )
+        else:
+            return decrypt_token(row["token_enc"])
 
     legacy = project.get("meta_access_token")
     if legacy:
