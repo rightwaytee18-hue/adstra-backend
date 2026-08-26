@@ -35,6 +35,7 @@ from typing import Optional
 
 import anthropic
 
+import autonomy
 import guards
 from crypto import token_for_project
 from db import get_db
@@ -57,6 +58,12 @@ MAX_SCALE_PCT = 20.0
 # DRY_RUN logs every decision and makes no Meta call that changes anything.
 # There was no such flag, so the only way to see what the engine would do to a
 # real account was to let it do it.
+#
+# ⚠️ For a long time this was not true. It covered the budget writes and not the
+# ad pause or the replacement-ad creation, so the flag you would set before
+# pointing the engine at a live account still paused that account's ads. Every
+# mutating Meta call in run_full_daily is now behind it. A new one has to be too,
+# and test_autonomy.py fails if one is not.
 DRY_RUN = os.environ.get("AUTOPILOT_DRY_RUN", "").lower() in ("1", "true", "yes")
 
 _anthropic_client: Optional[anthropic.Anthropic] = None
@@ -606,7 +613,22 @@ def run_full_daily(project_id: str) -> dict:
     max_account_daily = float(settings.get("max_account_daily_usd") or 1000.0)
     min_conversions_to_scale = int(settings.get("min_conversions_to_scale") or 50)
     scale_cooldown_hours = int(settings.get("scale_cooldown_hours") or 72)
-    approval_mode = settings.get("approval_mode", "manual")
+    # ⚠️ THE AGENCY IS A CEILING OVER THE CLIENT'S OWN TOGGLE.
+    #
+    # approval_mode is what the business owner chose in their portal, and they
+    # can set it to 'auto' themselves. Mason's instruction for Optic is that
+    # nothing changes on Meta without a human, and until this line existed his
+    # client could have overridden that from their own dashboard without anyone
+    # at Optic knowing. autonomy.effective_approval_mode can only ever turn auto
+    # into manual, never the reverse.
+    agency_mode = autonomy.agency_mode_for_project(project)
+    client_mode = settings.get("approval_mode", "manual")
+    approval_mode = autonomy.effective_approval_mode(agency_mode, client_mode)
+    if approval_mode != client_mode:
+        logger.info(
+            f"[daily] {project_id} approval_mode {client_mode} -> {approval_mode}: "
+            f"the agency is set to {agency_mode}."
+        )
 
     # ── Stop switches, checked before a single Meta call ──────────────────
     stopped = guards.killed() or guards.project_paused(settings)
@@ -629,6 +651,10 @@ def run_full_daily(project_id: str) -> dict:
     meta = MetaClient(token, account, page_id=project.get("facebook_page_id"))
     summary = {
         "project_id": project_id,
+        # Recorded on every run: "why did nothing happen" is otherwise only
+        # answerable by reading the agencies table by hand.
+        "agency_mode": agency_mode,
+        "approval_mode": approval_mode,
         "competitor_ads_scraped": 0,
         "ads_paused": 0,
         "ads_pause_queued": 0,
@@ -861,7 +887,15 @@ def run_full_daily(project_id: str) -> dict:
             continue
 
         try:
-            meta.pause(ad_id)
+            # ⚠️ THIS WAS NOT GUARDED, AND THE MODULE DOCSTRING SAID IT WAS.
+            # DRY_RUN claimed to make "no Meta call that changes anything", and
+            # covered only the budget path below. So the one flag you would reach
+            # for before pointing this engine at a real account still paused that
+            # account's ads, and still created replacement ads on it.
+            if DRY_RUN:
+                logger.info(f"[daily] DRY RUN would pause ad {ad_name} ({ad_id})")
+            else:
+                meta.pause(ad_id)
             summary["ads_paused"] += 1
             logger.info(f"[daily] Paused ad {ad_name} ({ad_id})")
 
@@ -881,11 +915,16 @@ def run_full_daily(project_id: str) -> dict:
         replacement_url = _generate_replacement(project, project_id, user_id, adset_id, summary)
 
         # ── Step 6: Upload replacement to Meta as new ad ───────
+        # Creating an ad is a write to a live account and costs real delivery, so
+        # it belongs behind the same flag as the pause that triggered it.
         if replacement_url and adset_id:
-            _upload_and_create_ad(
-                meta, project, project_id, user_id,
-                adset_id, replacement_url, ad_name, summary
-            )
+            if DRY_RUN:
+                logger.info(f"[daily] DRY RUN would create a replacement ad in adset {adset_id}")
+            else:
+                _upload_and_create_ad(
+                    meta, project, project_id, user_id,
+                    adset_id, replacement_url, ad_name, summary
+                )
 
     # ── Step 7: Budget actions ────────────────────────────────
     for rec in budget_actions:

@@ -6,6 +6,7 @@ import logging
 from datetime import datetime, timezone
 from typing import Any
 
+import autonomy
 import guards
 from crypto import token_for_project
 from db import get_db
@@ -56,7 +57,7 @@ def run_for_project(project_id: str) -> list[dict]:
         # select("*"), so a column added to the resolution path has to be added
         # here too or the six-hourly rules engine silently sees every
         # agency-credentialled project as disconnected while the daily loop works.
-        "id,user_id,meta_access_token,meta_access_token_enc,ad_credential_id,"
+        "id,user_id,meta_access_token,meta_access_token_enc,ad_credential_id,tenant_id,"
         "ad_account_id,meta_connected,target_roas,target_cpa,daily_budget_cap,goal"
     ).eq("id", project_id).maybe_single().execute()
 
@@ -82,7 +83,24 @@ def run_for_project(project_id: str) -> list[dict]:
         .execute()
     )
     settings = (settings_resp.data if settings_resp else None) or {}
-    approval_mode = settings.get("approval_mode") or "manual"
+
+    # ⚠️ THE AGENCY CEILING APPLIES HERE FIRST, NOT SECOND.
+    #
+    # This engine runs every six hours, four times more often than the autopilot.
+    # A gate the daily loop honours and this one does not is not a gate: the
+    # faster path simply wins, which is exactly how money-moving rule actions
+    # bypassed the approval queue for months before they were routed into it.
+    # tenant_id had to be added to the named column list above for this to
+    # resolve at all; without it every project reads as having no agency and
+    # fails open.
+    agency_mode = autonomy.agency_mode_for_project(project)
+    client_mode = settings.get("approval_mode") or "manual"
+    approval_mode = autonomy.effective_approval_mode(agency_mode, client_mode)
+    if approval_mode != client_mode:
+        logger.info(
+            f"[rules] {project_id} approval_mode {client_mode} -> {approval_mode}: "
+            f"the agency is set to {agency_mode}."
+        )
 
     # Stop switches apply here too. This engine runs every six hours, four times
     # more often than the autopilot, so a kill switch it did not honour would be
