@@ -33,6 +33,8 @@ import os
 from datetime import datetime, timezone
 from typing import Optional
 
+from margin_policy import roas_thresholds
+
 import anthropic
 
 import autonomy
@@ -460,7 +462,7 @@ def _extract_body(text: str) -> str:
 # PHASE 2: Daily Optimization
 # ─────────────────────────────────────────────────────────────
 
-def _daily_system_prompt(goal: str, s: dict) -> str:
+def _daily_system_prompt(goal: str, s: dict, project_id: str = "") -> str:
     """
     Build the decision prompt from THIS project's settings.
 
@@ -474,8 +476,14 @@ def _daily_system_prompt(goal: str, s: dict) -> str:
     has no ROAS at all, so the purchase-shaped version of these rules told the
     model to pause everything. The goal decides which rules it even sees.
     """
-    scale_roas_min = float(s.get("scale_roas_min") or 3.0)
-    kill_roas_max = float(s.get("kill_roas_max") or 0.8)
+    # ⚠️ THESE USED TO BE THE SAME TWO NUMBERS FOR EVERY BUSINESS ON THE
+    # PLATFORM, and break-even ROAS is 1 / gross margin. On a twenty point margin
+    # break-even is 5.0, so the shipped default of "scale above 3.0" said put more
+    # money behind a campaign losing forty cents on the dollar, and "kill below
+    # 0.8" left it running six times past the point it started costing the client
+    # money to win work. margin_policy derives both from what this client keeps,
+    # and falls back to the shipped defaults when nobody has said.
+    scale_roas_min, kill_roas_max, margin_note = roas_thresholds(project_id, s)
     kill_spend_min = float(s.get("kill_spend_min") or 50.0)
     max_daily = float(s.get("max_daily_budget_usd") or 500.0)
     max_account_daily = float(s.get("max_account_daily_usd") or 1000.0)
@@ -529,6 +537,11 @@ only on reach efficiency: CPM and frequency. Recommend a pause only when
 frequency is above 4.0, which means the same people are being shown the ad over
 and over."""
 
+    # Stated as the REASON for the thresholds, not as an extra rule. A model
+    # told only "scale above 5.0" on a thin-margin account will treat that as
+    # arbitrary and argue with it in its reasoning, which the customer then reads.
+    margin_line = f"\n{margin_note}\n" if margin_note else ""
+
     return f"""\
 You are an autonomous ad optimizer working on one advertiser's account. You
 receive ad-level, adset-level and campaign-level performance plus their targets.
@@ -546,7 +559,7 @@ Return ONLY a JSON object with two keys:
 }}
 
 {performance_rules}
-
+{margin_line}
 Hard limits that apply to every goal:
 - Never pause more than 3 ads in one run
 - Never take more than 3 budget actions in one run
@@ -831,7 +844,7 @@ def run_full_daily(project_id: str) -> dict:
         msg = client.messages.create(
             model=MODEL,
             max_tokens=1500,
-            system=_daily_system_prompt(goal, settings),
+            system=_daily_system_prompt(goal, settings, project_id),
             messages=[{"role": "user", "content": json.dumps(snapshot, indent=2)}],
         )
         raw = (msg.content[0].text if msg.content else "{}").strip()
