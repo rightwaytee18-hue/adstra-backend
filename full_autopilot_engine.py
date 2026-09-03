@@ -912,7 +912,9 @@ def run_full_daily(project_id: str) -> dict:
         # ── Step 5: Generate replacement creative ──────────────
         if not adset_id or adset_id in pause_target_entities:
             continue
-        replacement_url = _generate_replacement(project, project_id, user_id, adset_id, summary)
+        replacement_url, replacement_hypothesis = _generate_replacement(
+            project, project_id, user_id, adset_id, summary
+        )
 
         # ── Step 6: Upload replacement to Meta as new ad ───────
         # Creating an ad is a write to a live account and costs real delivery, so
@@ -923,7 +925,8 @@ def run_full_daily(project_id: str) -> dict:
             else:
                 _upload_and_create_ad(
                     meta, project, project_id, user_id,
-                    adset_id, replacement_url, ad_name, summary
+                    adset_id, replacement_url, ad_name, summary,
+                    hypothesis_id=replacement_hypothesis,
                 )
 
     # ── Step 7: Budget actions ────────────────────────────────
@@ -1040,21 +1043,37 @@ def _generate_replacement(
     user_id: str,
     adset_id: str,
     summary: dict,
-) -> Optional[str]:
+) -> tuple[Optional[str], Optional[str]]:
     """
-    Generate a fresh replacement creative. Returns image_url or None.
+    Generate a fresh replacement creative. Returns (image_url, hypothesis_id).
 
     (Competitor-image iteration is not used here: competitor_ads stores an
     ad-library snapshot page link, not a usable image URL.)
     """
     try:
         from creative_engine import NanaBanana
+        from creative_brief import direction_for
         banana = NanaBanana(get_db())
+
+        # ⚠️ THE ONE LINE THIS WHOLE PILLAR TURNED ON. What used to be passed
+        # here was the fixed string below, on every account, forever — so the
+        # replacement for a paused plumber's ad and the replacement for a
+        # paused coffee shop's ad were briefed identically. direction_for
+        # returns this client's live hypothesis instead: who it is aimed at,
+        # which of the fourteen levers it pulls, and a verbatim sentence one of
+        # their own buyers wrote. It falls back to the old string when the
+        # client has no hypothesis yet, and returns a null id in that case so
+        # the ad is recorded as unevidenced rather than mis-attributed.
+        brief, hypothesis_id = direction_for(
+            project_id,
+            "Fresh high-converting creative optimized for performance. Bold hook, clear CTA.",
+        )
 
         image_url, ad_text = banana.generate_fresh(
             project,
-            "Fresh high-converting creative optimized for performance. Bold hook, clear CTA.",
+            brief,
             project.get("business_name", ""),
+            brief=brief if hypothesis_id else "",
         )
 
         if image_url:
@@ -1066,17 +1085,25 @@ def _generate_replacement(
                 "prompt": f"Autopilot replacement for adset {adset_id}",
                 "image_url": image_url,
                 "is_saved": True,
-                "metadata": {"text": ad_text, "autopilot": True, "adset_id": adset_id},
+                "metadata": {
+                    "text": ad_text,
+                    "autopilot": True,
+                    "adset_id": adset_id,
+                    "hypothesis_id": hypothesis_id,
+                },
             }).execute()
             summary["creatives_generated"] += 1
-            logger.info(f"[daily] Replacement creative generated: {image_url[:60]}")
-            return image_url
+            logger.info(
+                f"[daily] Replacement creative generated: {image_url[:60]} "
+                f"(hypothesis {hypothesis_id or 'none'})"
+            )
+            return image_url, hypothesis_id
 
     except Exception as e:
         logger.warning(f"[daily] Creative generation failed (non-fatal): {e}")
         summary["errors"].append(f"Creative gen: {e}")
 
-    return None
+    return None, None
 
 
 def _upload_and_create_ad(
@@ -1088,12 +1115,32 @@ def _upload_and_create_ad(
     image_url: str,
     original_ad_name: str,
     summary: dict,
+    hypothesis_id: Optional[str] = None,
 ) -> None:
-    """Upload image to Meta and create a new ad in the given adset."""
+    """
+    Upload image to Meta and create a new ad in the given adset.
+
+    ⚠️ THIS PATH USED TO CREATE ADS THAT NOTHING COULD EVER SEE AGAIN. It called
+    create_ad and stopped: no ad_entities row and no utm_content on the link. So
+    an autopilot replacement was invisible to lib/crm/match.ts, contributed to
+    no hypothesis score, and appeared in no attribution — the engine could
+    replace an ad and then be structurally unable to learn whether the
+    replacement was better. campaign_builder.publish_for_project has always done
+    both; only this path did not.
+    """
+    from ad_entities import mint_utm_key, tagged_destination, upsert_entity
+
     try:
         business_name = project.get("business_name") or "Ad"
         store_url = project.get("store_url") or project.get("website") or ""
         timestamp_label = datetime.now(timezone.utc).strftime("%m/%d")
+
+        # Minted before the creative, because the creative carries the URL and
+        # the ad id does not exist until after it. Same order as the publish
+        # path, and for the same reason: this key is the only identifier we
+        # control on both sides of the join.
+        utm_content = mint_utm_key()
+        destination = tagged_destination(store_url, utm_content) if store_url else store_url
 
         # Every autopilot replacement ad on every account read "Shop {business}
         # now" with a SHOP_NOW button, including on plumbers and body shops.
@@ -1104,7 +1151,7 @@ def _upload_and_create_ad(
         creative_id = meta.create_ad_creative(
             name=f"Autopilot Creative — {timestamp_label}",
             image_hash=image_hash,
-            link=store_url,
+            link=destination,
             message=shape["message"].format(business=business_name),
             headline=business_name,
             description=None,
@@ -1122,6 +1169,21 @@ def _upload_and_create_ad(
         # approves it, which is the same rule every other money-moving action
         # follows. Approving flips it to ACTIVE (see autopilot_engine).
         ad_id = meta.create_ad(name=ad_name, adset_id=adset_id, creative_id=creative_id, status="PAUSED")
+
+        # The join key and the ad it belongs to, written together. Until this
+        # row exists a lead carrying utm_content has nothing to resolve to, and
+        # the hypothesis this ad argues for can never be scored.
+        upsert_entity(
+            project_id, "ad", ad_id,
+            parent_meta_id=adset_id,
+            name=ad_name,
+            status="PAUSED",
+            meta_creative_id=creative_id,
+            meta_image_hash=image_hash,
+            hypothesis_id=hypothesis_id,
+            utm_content=utm_content,
+            created_by="autopilot",
+        )
 
         summary["ads_created"] += 1
         _save_action(

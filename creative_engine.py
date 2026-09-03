@@ -122,15 +122,48 @@ class NanaBanana:
 
         return image_url, '\n'.join(text_parts)
 
-    def generate_fresh(self, project: dict, prompt: str, product_name: str = '') -> tuple:
+    def generate_fresh(self, project: dict, prompt: str, product_name: str = '',
+                       brief: str = '') -> tuple:
+        """
+        Fresh creative.
+
+        `brief` is the buyer psychology from Pillar 1 — who this is aimed at,
+        which lever it pulls, and the customer's own verbatim sentence. It is
+        rendered by reveal/lib/creative/brief.ts and stored on the hypothesis;
+        see creative_brief.py for why nothing here composes it.
+
+        ⚠️ THE BRIEF GOES FIRST AND THE BRAND IDENTITY SECOND, and the order is
+        the point. This prompt used to open with "premium brand aesthetic" and
+        two hex codes, so every ad on every account came out as a handsome
+        product shot. A model reads the top of the prompt as the assignment and
+        the rest as constraints; putting the buyer first is what makes the
+        colours a constraint on the argument rather than the argument itself.
+        """
         brand_ctx = _build_brand_context(project)
-        full_prompt = f"""{brand_ctx}
+
+        if brief:
+            full_prompt = f"""You are making one Facebook/Instagram ad aimed at a specific person, for a specific reason.
+
+{brief}
+
+The ad must look like it belongs to this brand:
+
+{brand_ctx}
+
+Product/focus: {product_name or 'main product'}
+
+Deliver a square 1:1 ad. Lead with the argument above, not with the product.
+The brand colours and style are how it should LOOK, not what it should SAY."""
+        else:
+            # No hypothesis with a brief for this client yet. Honest brand ad.
+            full_prompt = f"""{brand_ctx}
 
 Create a professional Facebook/Instagram ad creative.
 Product/focus: {product_name or 'main product'}
 Creative direction: {prompt}
 
 Deliver a polished, high-end square ad that reflects the brand identity above."""
+
         return self._extract_and_upload(self._call([full_prompt]), project['id'])
 
     def iterate_competitor(self, project: dict, competitor_url: str, prompt: str = '') -> tuple:
