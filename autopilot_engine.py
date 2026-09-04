@@ -408,6 +408,16 @@ def execute_approved_action(action_id: str, project_id: str) -> dict:
             # and the replacement stayed paused forever while the ad set sat one
             # ad lighter. Turning it on IS the approval.
             meta.set_status(entity_id, "ACTIVE")
+        elif action_type == "launch_campaign":
+            # ⚠️ THE ONLY PATH THAT CAN START A CAMPAIGN, and there was none.
+            #
+            # campaign_builder publishes campaign, ad set and ads all PAUSED, on
+            # purpose, so nothing spends before a person has seen it. The branch
+            # above only ever handled a replacement ad dropping into an ad set
+            # that was already live, so a freshly published campaign had no
+            # route to ACTIVE at any level and sat inert forever. Reveal queues
+            # this action from the owner's own tap; here is where it lands.
+            extra = _launch_campaign(meta, db, project_id, entity_id)
         elif action_type == "alert":
             pass  # alerts are informational only
         else:
@@ -430,6 +440,92 @@ def execute_approved_action(action_id: str, project_id: str) -> dict:
             "error_detail": str(e),
         }).eq("id", action_id).execute()
         return {"ok": False, "error": str(e)}
+
+
+def _launch_campaign(meta: MetaClient, db, project_id: str, campaign_id: str) -> dict:
+    """
+    Turn a published-but-paused campaign on, bottom up.
+
+    Ads first, then ad sets, then the campaign, because the campaign going ACTIVE
+    is the moment delivery can actually begin: doing it the other way round leaves
+    a live campaign over paused children, which reads as running and serves
+    nothing. Every intermediate state here is safe — a paused parent means no
+    delivery — so the only ordering that matters is which one is last.
+
+    Raises rather than half-succeeding. A row marked executed while nothing can
+    serve is the failure this whole module is built to avoid.
+    """
+    resp = (
+        db.table("published_campaigns")
+        .select("id, meta_campaign_id, meta_adset_ids, meta_ad_ids, publish_status")
+        .eq("project_id", project_id)
+        .eq("meta_campaign_id", campaign_id)
+        .order("created_at", desc=True)
+        .limit(1)
+        .execute()
+    )
+    rows = resp.data or []
+    if not rows:
+        raise MetaAPIError("No published campaign found to start")
+    row = rows[0]
+
+    status = row.get("publish_status")
+    if status == "active":
+        return {"already_active": True}
+    # Anything other than paused is a state nobody asked to start from, and
+    # guessing at it is how a stale queued action turns something back on.
+    if status != "paused":
+        raise MetaAPIError(f"This campaign is '{status}', so it is not waiting to be started")
+
+    ad_ids = row.get("meta_ad_ids") or []
+    adset_ids = row.get("meta_adset_ids") or []
+    if not ad_ids:
+        raise MetaAPIError("This campaign has no ads in it, so there is nothing to start")
+
+    live_ads, failures = [], []
+    for ad_id in ad_ids:
+        try:
+            meta.set_status(ad_id, "ACTIVE")
+            live_ads.append(ad_id)
+        except MetaAPIError as e:
+            failures.append(f"ad {ad_id}: {e}")
+    if not live_ads:
+        raise MetaAPIError("None of the ads could be started: " + "; ".join(failures[:3]))
+
+    live_adsets = []
+    for adset_id in adset_ids:
+        try:
+            meta.set_status(adset_id, "ACTIVE")
+            live_adsets.append(adset_id)
+        except MetaAPIError as e:
+            failures.append(f"adset {adset_id}: {e}")
+    if adset_ids and not live_adsets:
+        raise MetaAPIError("The ad set could not be started: " + "; ".join(failures[:3]))
+
+    meta.set_status(campaign_id, "ACTIVE")
+
+    db.table("published_campaigns").update({"publish_status": "active"}).eq("id", row["id"]).execute()
+
+    # ad_entities is what the portal and lib/crm/match.ts read for an ad's state,
+    # so leaving it PAUSED would show the owner switched-off ads that are running.
+    for entity_id in [campaign_id, *live_adsets, *live_ads]:
+        try:
+            db.table("ad_entities").update({"status": "ACTIVE"}).eq("project_id", project_id).eq(
+                "meta_id", entity_id
+            ).execute()
+        except Exception as e:
+            logger.warning(f"[launch] Could not mark {entity_id} active locally: {e}")
+
+    logger.info(
+        f"[launch] Project {project_id} campaign {campaign_id} is live "
+        f"({len(live_ads)}/{len(ad_ids)} ads)"
+    )
+    return {
+        "campaign_id": campaign_id,
+        "ads_started": len(live_ads),
+        "ads_total": len(ad_ids),
+        "partial_failures": failures[:5],
+    }
 
 
 # ─────────────────────────────────────────────────────────────

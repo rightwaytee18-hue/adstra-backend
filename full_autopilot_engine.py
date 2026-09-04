@@ -233,6 +233,33 @@ BOOTSTRAP_CREATIVE_PROMPTS = [
 ]
 
 
+# The daily figure the first campaign actually publishes at.
+#
+# This read `projects.daily_budget_cap` alone, and NOTHING in Reveal writes that
+# column, so every launch published at the $50 fallback no matter what the owner
+# had typed. The number they actually set is autopilot_settings.max_account_daily_usd,
+# validated on the way in as a daily dollar ceiling, and it is the same figure
+# the portal shows them, so it is the one to spend against.
+#
+# The floor stays $1 because Meta rejects a campaign under its own minimum, and
+# there is no ceiling here on purpose: the settings route already bounds the
+# input, and silently spending less than someone asked for is its own bug.
+def _launch_budget_cents(project: dict, settings: Optional[dict]) -> int:
+    stated = (settings or {}).get("max_account_daily_usd")
+    if stated is None:
+        stated = project.get("daily_budget_cap")
+    try:
+        dollars = float(stated) if stated is not None else 50.0
+    except (TypeError, ValueError):
+        dollars = 50.0
+    if dollars <= 0:
+        dollars = 50.0
+    # Half up, explicitly. round() is banker's rounding, so a half cent lands on
+    # whichever side is even and the same input can round two ways. The +0.5 also
+    # absorbs float representation error, where 0.29 * 100 is 28.999999999999996.
+    return max(100, int(dollars * 100 + 0.5))
+
+
 def bootstrap_project(project_id: str) -> dict:
     """
     Run once when user first enables autopilot.
@@ -344,6 +371,7 @@ def bootstrap_project(project_id: str) -> dict:
         errors.append(f"Rules creation failed: {e}")
 
     # ── Step 3: Publish initial campaign ─────────────────────
+    campaign_published = False
     if not creatives_for_campaign:
         # Can't publish without creatives — skip but don't fail
         steps.append({"step": "campaign", "status": "skipped", "detail": "No creatives available"})
@@ -372,7 +400,7 @@ def bootstrap_project(project_id: str) -> dict:
                 "age_min": project.get("target_age_min") or 18,
                 "age_max": project.get("target_age_max") or 65,
                 "gender": project.get("target_gender") or "all",
-                "daily_budget_cents": int((project.get("daily_budget_cap") or 50) * 100),
+                "daily_budget_cents": _launch_budget_cents(project, settings),
                 "budget_mode": "cbo",
                 "bid_strategy": "LOWEST_COST_WITHOUT_CAP",
                 "link_url": store_url,
@@ -383,6 +411,7 @@ def bootstrap_project(project_id: str) -> dict:
             result = publish_for_project(project_id, draft)
 
             if result.get("ok"):
+                campaign_published = True
                 steps.append({
                     "step": "campaign",
                     "status": "ok",
@@ -401,12 +430,38 @@ def bootstrap_project(project_id: str) -> dict:
             errors.append(f"Campaign publish exception: {e}")
 
     # ── Mark bootstrapped ────────────────────────────────────
-    # A critical error is one where creatives failed for a real reason (not just Gemini unavailable)
+    # ⚠️ ONLY when a campaign actually published. This flag is a ONE-WAY DOOR:
+    # the guard at the top of this function returns early forever once it is
+    # set, and the daily loop checks it too. It used to be written
+    # unconditionally, so a project that ran once with no GEMINI_API_KEY
+    # generated nothing, skipped the publish, recorded itself "complete" and
+    # could never try again. The first customer to set a budget before that key
+    # was on the box would have been permanently stuck with no campaign and
+    # nothing anywhere reading as wrong.
+    #
+    # Both skip reasons are things that get fixed later and are worth retrying:
+    # a missing model key, and Meta not connected yet. So leave the door open
+    # and say which one it is.
+    blocked_reason = None
+    if not campaign_published:
+        if gemini_unavailable:
+            blocked_reason = "No creatives yet: GEMINI_API_KEY is not set on the engine."
+        elif not creatives_for_campaign:
+            blocked_reason = "No creatives could be generated."
+        elif not project.get("meta_connected") or not token_for_project(project):
+            blocked_reason = "Meta is not connected yet."
+        else:
+            blocked_reason = "The first campaign did not publish."
+
     had_critical_error = not creatives_for_campaign and not gemini_unavailable
     _update_settings(project_id, {
-        "bootstrapped": True,
-        "bootstrap_status": "error" if had_critical_error else "complete",
-        "bootstrap_error": "; ".join(errors) if errors else None,
+        "bootstrapped": campaign_published,
+        "bootstrap_status": (
+            "complete" if campaign_published
+            else "error" if had_critical_error
+            else "blocked"
+        ),
+        "bootstrap_error": "; ".join(errors) if errors else blocked_reason,
     })
 
     # Success notification
