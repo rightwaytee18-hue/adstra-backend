@@ -158,136 +158,176 @@ def publish_for_project(project_id: str, draft: dict) -> dict:
     if interests:
         targeting["interests"] = interests
 
-    # --- Step 1: Create campaign ---
-    try:
-        cbo_budget = daily_budget_cents if budget_mode == "cbo" else None
-        campaign_id = client.create_campaign(
-            name=campaign_name,
-            objective=objective,
-            special_ad_categories=special_ad_categories,
-            daily_budget_cents=cbo_budget,
-            bid_strategy=bid_strategy,
-        )
-        steps.append({"step": "campaign", "status": "ok", "detail": campaign_id})
-        logger.info(f"[campaign_builder] Created campaign {campaign_id} for project {project_id}")
-        upsert_entity(project_id, "campaign", campaign_id, name=campaign_name, status="PAUSED")
-    except MetaAPIError as e:
-        steps.append({"step": "campaign", "status": "error", "detail": str(e)})
-        return {"ok": False, "fatal": str(e), "campaign_id": None, "adset_id": None, "ad_ids": [], "steps": steps, "errors": [str(e)]}
+    # Ad sets to build.
+    #
+    # ⚠️ ONE CAMPAIGN, MANY AD SETS, AND THE BUDGET STAYS ON THE CAMPAIGN.
+    # Running three verticals as three CAMPAIGNS splits the budget three ways up
+    # front and asks Meta to learn each one from a third of the data. With the
+    # budget on one campaign, spend moves to whichever vertical is answering,
+    # which is the entire reason to segment by vertical instead of guessing which
+    # one works before any of them has run.
+    #
+    # A draft with no "adsets" key behaves exactly as it always did: one ad set
+    # carrying every creative. Every existing caller is unchanged.
+    adset_specs = draft.get("adsets")
+    if not isinstance(adset_specs, list) or not adset_specs:
+        adset_specs = [{"name": draft.get("adset_name") or campaign_name, "creatives": creatives_data}]
 
-    # --- Step 2: Create ad set ---
-    try:
-        promoted_object = None
-        event_type = TEMPLATE_EVENT.get(template_key)
-        if event_type and pixel_id:
-            promoted_object = {"pixel_id": pixel_id, "custom_event_type": event_type}
-
-        abo_budget = daily_budget_cents if budget_mode == "abo" else None
-        bid_amount = draft.get("target_cpa_cents") if bid_strategy == "COST_CAP" else None
-
-        adset_id = client.create_adset(
-            campaign_id=campaign_id,
-            name=f"{campaign_name} - Ad Set 1",
-            optimization_goal=optimization_goal,
-            targeting=targeting,
-            attribution_spec=DEFAULT_ATTRIBUTION,
-            promoted_object=promoted_object,
-            daily_budget_cents=abo_budget,
-            bid_strategy=bid_strategy,
-            bid_amount_cents=bid_amount,
-        )
-        steps.append({"step": "adset", "status": "ok", "detail": adset_id})
-        logger.info(f"[campaign_builder] Created adset {adset_id}")
-        upsert_entity(project_id, "adset", adset_id, parent_meta_id=campaign_id,
-                      name=draft.get("adset_name") or campaign_name, status="PAUSED")
-    except MetaAPIError as e:
-        steps.append({"step": "adset", "status": "error", "detail": str(e)})
-        # Campaign created but adset failed — record partial result
-        _save_published(project_id, draft, campaign_id, [], [], steps, errors)
-        return {"ok": False, "campaign_id": campaign_id, "adset_id": None, "ad_ids": [], "steps": steps, "errors": [str(e)]}
-
-    # --- Steps 3-5: Per creative: upload image → creative → ad ---
-    for i, creative in enumerate(creatives_data):
-        image_url = creative.get("image_url", "")
-        headline = creative.get("headline", "")
-        message = creative.get("message", "")
-        description = creative.get("description", "")
-        ad_num = i + 1
-
-        # Minted BEFORE the creative, because the creative carries the URL and the
-        # ad id does not exist until after it. This key is the only identifier we
-        # control, and it is written onto the ad_entities row below alongside the
-        # ad id Meta hands back, which is what joins the two.
-        utm_content = mint_utm_key()
-        ad_destination = tagged_destination(destination, utm_content, campaign_slug)
-
-        # Upload image
+    # --- Step 1: Create campaign (or attach to one already made) ---
+    #
+    # An existing campaign_id lets a second call add another vertical to a
+    # campaign that is already running, instead of the only shape this function
+    # used to have, which was a brand new campaign every single time.
+    existing_campaign = (draft.get("campaign_id") or "").strip() or None
+    if existing_campaign:
+        campaign_id = existing_campaign
+        steps.append({"step": "campaign", "status": "ok", "detail": f"reused {campaign_id}"})
+    else:
         try:
-            image_hash = client.upload_image_from_url(image_url, filename=f"adstra_creative_{ad_num}.jpg")
-            steps.append({"step": f"image_{ad_num}", "status": "ok", "detail": image_hash[:16] + "…"})
-        except (MetaAPIError, Exception) as e:
-            err = f"Ad {ad_num} image upload failed: {e}"
-            steps.append({"step": f"image_{ad_num}", "status": "error", "detail": str(e)})
-            errors.append(err)
-            logger.warning(f"[campaign_builder] {err}")
-            continue  # Try next creative
-
-        # Create ad creative
-        try:
-            creative_id = client.create_ad_creative(
-                name=f"Creative {ad_num} - {headline[:40]}",
-                image_hash=image_hash,
-                link=ad_destination,
-                message=message,
-                headline=headline,
-                description=description or None,
-                cta_type=cta_type,
+            cbo_budget = daily_budget_cents if budget_mode == "cbo" else None
+            campaign_id = client.create_campaign(
+                name=campaign_name,
+                objective=objective,
+                special_ad_categories=special_ad_categories,
+                daily_budget_cents=cbo_budget,
+                bid_strategy=bid_strategy,
             )
-            steps.append({"step": f"creative_{ad_num}", "status": "ok", "detail": creative_id})
+            steps.append({"step": "campaign", "status": "ok", "detail": campaign_id})
+            logger.info(f"[campaign_builder] Created campaign {campaign_id} for project {project_id}")
+            upsert_entity(project_id, "campaign", campaign_id, name=campaign_name, status="PAUSED")
         except MetaAPIError as e:
-            err = f"Ad {ad_num} creative creation failed: {e}"
-            steps.append({"step": f"creative_{ad_num}", "status": "error", "detail": str(e)})
-            errors.append(err)
-            logger.warning(f"[campaign_builder] {err}")
+            steps.append({"step": "campaign", "status": "error", "detail": str(e)})
+            return {"ok": False, "fatal": str(e), "campaign_id": None, "adset_id": None,
+                    "adset_ids": [], "ad_ids": [], "steps": steps, "errors": [str(e)]}
+
+    adset_ids: list[str] = []
+    ad_num = 0
+
+    for si, spec in enumerate(adset_specs):
+        spec_name = spec.get("name") or f"{campaign_name} - Ad Set {si + 1}"
+
+        # Per-ad-set targeting. Only the keys a vertical actually varies are
+        # overridden; everything else stays the campaign's own targeting, so an
+        # ad set cannot silently widen the geography or the age range.
+        spec_targeting = dict(targeting)
+        if spec.get("interests"):
+            spec_targeting["interests"] = spec["interests"]
+
+        # --- Step 2: Create ad set ---
+        try:
+            promoted_object = None
+            event_type = TEMPLATE_EVENT.get(template_key)
+            if event_type and pixel_id:
+                promoted_object = {"pixel_id": pixel_id, "custom_event_type": event_type}
+
+            abo_budget = daily_budget_cents if budget_mode == "abo" else None
+            bid_amount = draft.get("target_cpa_cents") if bid_strategy == "COST_CAP" else None
+
+            adset_id = client.create_adset(
+                campaign_id=campaign_id,
+                name=spec_name,
+                optimization_goal=optimization_goal,
+                targeting=spec_targeting,
+                attribution_spec=DEFAULT_ATTRIBUTION,
+                promoted_object=promoted_object,
+                daily_budget_cents=abo_budget,
+                bid_strategy=bid_strategy,
+                bid_amount_cents=bid_amount,
+            )
+            steps.append({"step": f"adset_{si + 1}", "status": "ok", "detail": adset_id})
+            logger.info(f"[campaign_builder] Created adset {adset_id} ({spec_name})")
+            adset_ids.append(adset_id)
+            upsert_entity(project_id, "adset", adset_id, parent_meta_id=campaign_id,
+                          name=spec_name, status="PAUSED")
+        except MetaAPIError as e:
+            # One vertical failing must not take the others down with it. The
+            # campaign and every ad set already built stay, and the error is
+            # reported against the ad set that caused it.
+            steps.append({"step": f"adset_{si + 1}", "status": "error", "detail": str(e)})
+            errors.append(f"Ad set {spec_name} failed: {e}")
+            logger.warning(f"[campaign_builder] adset {spec_name} failed: {e}")
             continue
 
-        # Create ad
-        try:
-            ad_id = client.create_ad(
-                name=f"{campaign_name} - Ad {ad_num}",
-                adset_id=adset_id,
-                creative_id=creative_id,
-            )
-            steps.append({"step": f"ad_{ad_num}", "status": "ok", "detail": ad_id})
-            ad_ids.append(ad_id)
-            logger.info(f"[campaign_builder] Created ad {ad_id}")
-            # The join key and the ad it belongs to, written together. Until this
-            # row exists a lead carrying utm_content has nothing to resolve to.
-            upsert_entity(
-                project_id, "ad", ad_id,
-                parent_meta_id=adset_id,
-                name=f"{campaign_name} - Ad {ad_num}",
-                status="PAUSED",
-                meta_creative_id=creative_id,
-                meta_image_hash=image_hash,
-                creative_generation_id=creative.get("creative_generation_id"),
-                hypothesis_id=creative.get("hypothesis_id"),
-                utm_content=utm_content,
-            )
-        except MetaAPIError as e:
-            err = f"Ad {ad_num} creation failed: {e}"
-            steps.append({"step": f"ad_{ad_num}", "status": "error", "detail": str(e)})
-            errors.append(err)
-            logger.warning(f"[campaign_builder] {err}")
+        # --- Steps 3-5: Per creative: upload image → creative → ad ---
+        for creative in (spec.get("creatives") or []):
+            image_url = creative.get("image_url", "")
+            headline = creative.get("headline", "")
+            message = creative.get("message", "")
+            description = creative.get("description", "")
+            ad_num += 1
+
+            # Minted BEFORE the creative, because the creative carries the URL and
+            # the ad id does not exist until after it. This key is the only
+            # identifier we control, and it is written onto the ad_entities row
+            # below alongside the ad id Meta hands back, which joins the two.
+            utm_content = mint_utm_key()
+            ad_destination = tagged_destination(destination, utm_content, campaign_slug)
+
+            try:
+                image_hash = client.upload_image_from_url(image_url, filename=f"adstra_creative_{ad_num}.jpg")
+                steps.append({"step": f"image_{ad_num}", "status": "ok", "detail": image_hash[:16] + "…"})
+            except (MetaAPIError, Exception) as e:
+                err = f"Ad {ad_num} image upload failed: {e}"
+                steps.append({"step": f"image_{ad_num}", "status": "error", "detail": str(e)})
+                errors.append(err)
+                logger.warning(f"[campaign_builder] {err}")
+                continue
+
+            try:
+                creative_id = client.create_ad_creative(
+                    name=f"Creative {ad_num} - {headline[:40]}",
+                    image_hash=image_hash,
+                    link=ad_destination,
+                    message=message,
+                    headline=headline,
+                    description=description or None,
+                    cta_type=cta_type,
+                )
+                steps.append({"step": f"creative_{ad_num}", "status": "ok", "detail": creative_id})
+            except MetaAPIError as e:
+                err = f"Ad {ad_num} creative creation failed: {e}"
+                steps.append({"step": f"creative_{ad_num}", "status": "error", "detail": str(e)})
+                errors.append(err)
+                logger.warning(f"[campaign_builder] {err}")
+                continue
+
+            try:
+                ad_id = client.create_ad(
+                    name=f"{spec_name} - Ad {ad_num}",
+                    adset_id=adset_id,
+                    creative_id=creative_id,
+                )
+                steps.append({"step": f"ad_{ad_num}", "status": "ok", "detail": ad_id})
+                ad_ids.append(ad_id)
+                logger.info(f"[campaign_builder] Created ad {ad_id}")
+                upsert_entity(
+                    project_id, "ad", ad_id,
+                    parent_meta_id=adset_id,
+                    name=f"{spec_name} - Ad {ad_num}",
+                    status="PAUSED",
+                    meta_creative_id=creative_id,
+                    meta_image_hash=image_hash,
+                    creative_generation_id=creative.get("creative_generation_id"),
+                    hypothesis_id=creative.get("hypothesis_id"),
+                    utm_content=utm_content,
+                )
+            except MetaAPIError as e:
+                err = f"Ad {ad_num} creation failed: {e}"
+                steps.append({"step": f"ad_{ad_num}", "status": "error", "detail": str(e)})
+                errors.append(err)
+                logger.warning(f"[campaign_builder] {err}")
 
     # Save record regardless of partial failure
-    _save_published(project_id, draft, campaign_id, [adset_id] if adset_id else [], ad_ids, steps, errors)
+    _save_published(project_id, draft, campaign_id, adset_ids, ad_ids, steps, errors)
 
     ok = len(ad_ids) > 0
     return {
         "ok": ok,
         "campaign_id": campaign_id,
-        "adset_id": adset_id,
+        # Kept for every existing caller, which reads one ad set and knows
+        # nothing about verticals. adset_ids is the honest answer now.
+        "adset_id": adset_ids[0] if adset_ids else None,
+        "adset_ids": adset_ids,
         "ad_ids": ad_ids,
         "steps": steps,
         "errors": errors,
