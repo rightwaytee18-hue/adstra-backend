@@ -515,8 +515,15 @@ class MetaClient:
         headline: str,
         description: Optional[str] = None,
         cta_type: str = "LEARN_MORE",
+        url_tags: Optional[str] = None,
     ) -> str:
-        """Create an ad creative. Returns creative_id."""
+        """
+        Create an ad creative. Returns creative_id.
+
+        url_tags is Meta's "URL parameters" field (see url_tags.py): appended to
+        the link on every click with {{campaign.id}} / {{adset.id}} / {{ad.id}}
+        filled in by Meta. Sent verbatim, never encoded.
+        """
         if not self.page_id:
             raise MetaAPIError("facebook_page_id is required to create ad creatives")
 
@@ -535,10 +542,13 @@ class MetaClient:
             "link_data": link_data,
         }
 
-        result = self._post(f"{self.account}/adcreatives", {
+        body = {
             "name": name,
             "object_story_spec": json.dumps(object_story_spec),
-        })
+        }
+        if url_tags:
+            body["url_tags"] = url_tags
+        result = self._post(f"{self.account}/adcreatives", body)
         return result["id"]
 
     def search_targeting(self, kind: str, query: str) -> Optional[dict]:

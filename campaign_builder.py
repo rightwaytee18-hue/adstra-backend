@@ -15,6 +15,7 @@ from conversions import GOALS, campaign_shape
 from crypto import token_for_project
 from db import get_db
 from meta_client import MetaClient, MetaAPIError
+from url_tags import meta_url_tags
 
 logger = logging.getLogger(__name__)
 
@@ -337,6 +338,9 @@ def publish_for_project(project_id: str, draft: dict) -> dict:
                     headline=headline,
                     description=description or None,
                     cta_type=cta_type,
+                    # Reveal sends its own (lib/ads/meta/urlTags.ts); anything
+                    # else built here still carries the three Meta ids.
+                    url_tags=draft.get("url_tags") or meta_url_tags(ad_destination),
                 )
                 steps.append({"step": f"creative_{ad_num}", "status": "ok", "detail": creative_id})
             except MetaAPIError as e:

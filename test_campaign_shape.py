@@ -36,6 +36,7 @@ class FakeMeta:
         self.campaigns: list[dict] = []
         self.adsets: list[dict] = []
         self.ads: list[dict] = []
+        self.creatives: list[dict] = []
 
     def create_campaign(self, **kw):
         self.campaigns.append(kw)
@@ -48,7 +49,8 @@ class FakeMeta:
     def upload_image_from_url(self, *_a, **_k):
         return "imagehash"
 
-    def create_ad_creative(self, **_kw):
+    def create_ad_creative(self, **kw):
+        self.creatives.append(kw)
         return "creative_1"
 
     def create_ad(self, **kw):
@@ -96,6 +98,19 @@ class CampaignShape(unittest.TestCase):
         self.assertEqual(len(fake.adsets), 1, "one ad set when none were asked for")
         self.assertEqual(len(fake.ads), 2, "both creatives became ads")
         self.assertEqual(result["adset_id"], "adset_1", "the old single-value key still answers")
+
+    def test_every_creative_carries_the_meta_ids(self):
+        """Reveal's url_tags go through verbatim; without them the three Meta ids are still added."""
+        tags = "utm_source=facebook&fb_campaign={{campaign.id}}&fb_adset={{adset.id}}&fb_ad={{ad.id}}"
+        _, fake = self._publish({"creatives": [creative("a")], "url_tags": tags})
+        self.assertEqual(fake.creatives[0]["url_tags"], tags)
+        _, fake = self._publish({"creatives": [creative("a")]})
+        # The link may already carry some ids (tagged_destination); together
+        # the link and url_tags must carry all three, and none twice.
+        c = fake.creatives[0]
+        both = c["link"] + "&" + c["url_tags"]
+        for k in ("fb_campaign=", "fb_adset=", "fb_ad="):
+            self.assertEqual(both.count(k), 1, k)
 
     def test_three_verticals_make_one_campaign_with_three_adsets(self):
         result, fake = self._publish({

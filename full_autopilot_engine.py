@@ -42,6 +42,7 @@ import guards
 from crypto import token_for_project
 from db import get_db
 from meta_client import MetaClient, MetaAPIError
+from url_tags import meta_url_tags
 from ad_entities import reconcile_entities
 from conversions import campaign_shape
 from snapshots import write_daily_snapshot
@@ -1224,6 +1225,7 @@ def _upload_and_create_ad(
             headline=business_name,
             description=None,
             cta_type=shape["cta_type"],
+            url_tags=meta_url_tags(destination) if destination else None,
         )
 
         ad_name = f"Replacement {timestamp_label}"
