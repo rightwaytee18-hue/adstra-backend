@@ -55,6 +55,17 @@ class FakeMeta:
         self.ads.append(kw)
         return f"ad_{len(self.ads)}"
 
+    # Meta's targeting search, answered from a fixed table. A phrase not in it
+    # is a miss, which is how Meta answers a phrase it has no audience for.
+    KNOWN = {
+        ("adinterest", "Interior design"): {"id": "6003", "name": "Interior design"},
+        ("adinterest", "Antiques"): {"id": "6004", "name": "Antiques"},
+        ("adworkposition", "Interior designer"): {"id": "wp1", "name": "Interior designer"},
+    }
+
+    def search_targeting(self, kind, query):
+        return self.KNOWN.get((kind, query))
+
 
 PROJECT = {
     "id": "p1", "ad_account_id": "act_1", "facebook_page_id": "page_1",
@@ -150,6 +161,57 @@ class CampaignShape(unittest.TestCase):
         self.assertEqual(len(result["adset_ids"]), 2, "the two good verticals still shipped")
         self.assertTrue(result["ok"], "a partial launch is still a launch")
         self.assertTrue(any("Plumbing" in e for e in result["errors"]), "and it says which one failed")
+
+
+    def test_audience_split_funds_each_segment_its_own_share(self):
+        """50/50 means each ad set carries half, not each the whole budget."""
+        _, fake = self._publish({
+            "budget_mode": "abo",
+            "daily_budget_cents": 5000,
+            "adsets": [
+                {"name": "homeowners", "daily_budget_cents": 2500, "interest_queries": ["Antiques"],
+                 "work_position_queries": [], "age_min": 30, "age_max": 65, "creatives": [creative("a")]},
+                {"name": "designers", "daily_budget_cents": 2500, "interest_queries": ["Interior design"],
+                 "work_position_queries": ["Interior designer"], "age_min": None, "age_max": None,
+                 "creatives": [creative("a")]},
+            ],
+        })
+        self.assertEqual(len(fake.campaigns), 1)
+        self.assertIsNone(fake.campaigns[0]["daily_budget_cents"], "ABO: no budget on the campaign")
+        self.assertEqual([a["daily_budget_cents"] for a in fake.adsets], [2500, 2500])
+
+    def test_segment_targeting_is_resolved_not_stored(self):
+        _, fake = self._publish({
+            "adsets": [
+                {"name": "homeowners", "interest_queries": ["Antiques", "Nothing Meta knows"],
+                 "age_min": 30, "age_max": 65, "creatives": [creative("a")]},
+                {"name": "designers", "interest_queries": ["Interior design"],
+                 "work_position_queries": ["Interior designer"], "creatives": [creative("b")]},
+            ],
+        })
+        home, design = fake.adsets[0]["targeting"], fake.adsets[1]["targeting"]
+        self.assertEqual(home["flexible_spec"], [{"interests": [{"id": "6004", "name": "Antiques"}]}],
+                         "a phrase Meta does not know is dropped, the rest kept")
+        self.assertEqual((home["age_min"], home["age_max"]), (30, 65))
+        self.assertEqual(design["flexible_spec"][0]["work_positions"][0]["id"], "wp1")
+        self.assertEqual(design["flexible_spec"][0]["interests"][0]["id"], "6003")
+        # Advantage+ audience would widen past the segment and refuse age_min 30.
+        self.assertEqual(home["targeting_automation"], {"advantage_audience": 0})
+        self.assertNotIn("interests", home, "interests live in flexible_spec only")
+
+    def test_a_segment_with_no_resolvable_audience_is_not_built_broad(self):
+        result, fake = self._publish({
+            "adsets": [
+                {"name": "homeowners", "interest_queries": ["Antiques"], "creatives": [creative("a")]},
+                {"name": "designers", "interest_queries": ["Nothing Meta knows"], "creatives": [creative("b")]},
+            ],
+        })
+        self.assertEqual([a["name"] for a in fake.adsets], ["homeowners"], "the empty segment is skipped")
+        self.assertTrue(any("designers" in e for e in result["errors"]), "and it says so")
+
+    def test_no_segments_keeps_advantage_audience(self):
+        _, fake = self._publish({"creatives": [creative("a")]})
+        self.assertEqual(fake.adsets[0]["targeting"]["targeting_automation"], {"advantage_audience": 1})
 
 
 if __name__ == "__main__":

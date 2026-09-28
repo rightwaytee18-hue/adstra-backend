@@ -541,6 +541,20 @@ class MetaClient:
         })
         return result["id"]
 
+    def search_targeting(self, kind: str, query: str) -> Optional[dict]:
+        """
+        Best Meta match for a targeting phrase, as {"id", "name"}, or None.
+
+        kind is "adinterest" (interests) or "adworkposition" (job titles). Read
+        at build time on purpose: interest ids are retired by Meta without
+        notice, so a stored id is a future failed ad set.
+        """
+        result = self._get("search", {"type": kind, "q": query, "limit": 1})
+        rows = result.get("data") or []
+        if not rows or not rows[0].get("id"):
+            return None
+        return {"id": str(rows[0]["id"]), "name": str(rows[0].get("name") or query)}
+
     def create_ad(self, name: str, adset_id: str, creative_id: str, status: str = "PAUSED") -> str:
         """
         Create an ad. Returns ad_id.

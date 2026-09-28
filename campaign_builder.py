@@ -79,6 +79,20 @@ def preflight_for_project(project_id: str, draft: dict) -> dict:
     return {"ok": ok, "steps": steps}
 
 
+def _resolve(client: MetaClient, kind: str, queries: list[str]) -> list[dict]:
+    """Each phrase to its best Meta match; misses are dropped, duplicates collapsed."""
+    found: dict[str, dict] = {}
+    for q in queries[:12]:
+        try:
+            hit = client.search_targeting(kind, q)
+        except MetaAPIError as e:
+            logger.warning(f"[campaign_builder] targeting search {kind} '{q}' failed: {e}")
+            continue
+        if hit:
+            found[hit["id"]] = hit
+    return list(found.values())
+
+
 def publish_for_project(project_id: str, draft: dict) -> dict:
     """
     Full publish flow: campaign → adset → image upload → creative → ad.
@@ -213,6 +227,41 @@ def publish_for_project(project_id: str, draft: dict) -> dict:
         if spec.get("interests"):
             spec_targeting["interests"] = spec["interests"]
 
+        # Audience segments (the media buyer's split) name their audience in
+        # words; each phrase is looked up in Meta's targeting search now, never
+        # stored as an id. A segment that asked for an audience and resolved to
+        # none is NOT built broad: an ad set named "designers" spending on
+        # everyone is the split quietly lying. It fails like any other ad set.
+        wanted_interests = [q for q in (spec.get("interest_queries") or []) if q]
+        wanted_titles = [q for q in (spec.get("work_position_queries") or []) if q]
+        if wanted_interests or wanted_titles:
+            found_interests = _resolve(client, "adinterest", wanted_interests)
+            found_titles = _resolve(client, "adworkposition", wanted_titles)
+            if not found_interests and not found_titles:
+                err = f"Ad set {spec_name}: Meta found none of its audience ({', '.join(wanted_interests + wanted_titles)[:200]})."
+                steps.append({"step": f"adset_{si + 1}", "status": "error", "detail": err})
+                errors.append(err)
+                continue
+            # Interests and job titles in one flexible_spec entry are OR'd, which
+            # is the meaning of "people who like design OR work as designers".
+            flex: dict = {}
+            if found_interests:
+                flex["interests"] = found_interests
+            if found_titles:
+                flex["work_positions"] = found_titles
+            spec_targeting.pop("interests", None)
+            spec_targeting["flexible_spec"] = [flex]
+            # ⚠️ Advantage+ audience OFF for a named segment. With it on Meta
+            # treats the interests as a suggestion and widens past them, and it
+            # refuses an age_min above 25 outright, so a 30+ segment would fail.
+            spec_targeting["targeting_automation"] = {"advantage_audience": 0}
+            steps.append({"step": f"audience_{si + 1}", "status": "ok",
+                          "detail": ", ".join(x["name"] for x in found_interests + found_titles)[:300]})
+        if spec.get("age_min"):
+            spec_targeting["age_min"] = int(spec["age_min"])
+        if spec.get("age_max"):
+            spec_targeting["age_max"] = int(spec["age_max"])
+
         # --- Step 2: Create ad set ---
         try:
             promoted_object = None
@@ -220,7 +269,9 @@ def publish_for_project(project_id: str, draft: dict) -> dict:
             if event_type and pixel_id:
                 promoted_object = {"pixel_id": pixel_id, "custom_event_type": event_type}
 
-            abo_budget = daily_budget_cents if budget_mode == "abo" else None
+            # A segment carries its own share of the budget; without one every
+            # ad set gets the draft's budget, as before.
+            abo_budget = (spec.get("daily_budget_cents") or daily_budget_cents) if budget_mode == "abo" else None
             bid_amount = draft.get("target_cpa_cents") if bid_strategy == "COST_CAP" else None
 
             adset_id = client.create_adset(
