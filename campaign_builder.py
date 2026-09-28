@@ -261,6 +261,10 @@ def publish_for_project(project_id: str, draft: dict) -> dict:
             spec_targeting["age_min"] = int(spec["age_min"])
         if spec.get("age_max"):
             spec_targeting["age_max"] = int(spec["age_max"])
+        # A customer type aimed by age alone ("people 35 to 65") needs the same
+        # switch: with Advantage+ audience on, Meta refuses an age_min above 25.
+        if (spec.get("age_min") or spec.get("age_max")) and "adsets" in draft:
+            spec_targeting["targeting_automation"] = {"advantage_audience": 0}
 
         # --- Step 2: Create ad set ---
         try:

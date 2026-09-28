@@ -209,6 +209,17 @@ class CampaignShape(unittest.TestCase):
         self.assertEqual([a["name"] for a in fake.adsets], ["homeowners"], "the empty segment is skipped")
         self.assertTrue(any("designers" in e for e in result["errors"]), "and it says so")
 
+    def test_one_customer_type_aimed_by_age_alone_turns_advantage_off(self):
+        """A single type "people 35 to 65" with no interests: Meta refuses age_min
+        above 25 while Advantage+ audience is on, so the segment switches it off."""
+        _, fake = self._publish({
+            "adsets": [{"name": "homeowners", "age_min": 35, "age_max": 65, "creatives": [creative("a")]}],
+        })
+        t = fake.adsets[0]["targeting"]
+        self.assertEqual((t["age_min"], t["age_max"]), (35, 65))
+        self.assertEqual(t["targeting_automation"], {"advantage_audience": 0})
+        self.assertNotIn("flexible_spec", t, "no interests asked for, none invented")
+
     def test_no_segments_keeps_advantage_audience(self):
         _, fake = self._publish({"creatives": [creative("a")]})
         self.assertEqual(fake.adsets[0]["targeting"]["targeting_automation"], {"advantage_audience": 1})
